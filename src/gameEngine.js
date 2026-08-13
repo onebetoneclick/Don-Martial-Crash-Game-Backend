@@ -22,31 +22,47 @@ class CrashGame {
     }
 
     // ----------------------------------------
-    // CREATE A RANDOM CRASH POINT
+    // GENERATE RANDOM CRASH POINT
     // ----------------------------------------
 
     generateCrashPoint() {
 
-        const randomBytes = crypto.randomBytes(8);
+        /*
+         * Generate a random 32-bit unsigned integer.
+         *
+         * We convert it to a normal JavaScript number
+         * between 0 and 1.
+         */
 
-        const randomNumber =
-            randomBytes.readBigUInt64BE() /
-            BigInt("18446744073709551615");
+        const randomBuffer =
+            crypto.randomBytes(4);
+
+        const randomInteger =
+            randomBuffer.readUInt32BE(0);
 
         const random =
-            Number(randomNumber);
+            randomInteger / 0xFFFFFFFF;
 
-        // Demo crash-point formula
+        /*
+         * Demo crash-point formula.
+         *
+         * This is NOT the final provably-fair
+         * implementation.
+         *
+         * We will build the proper fairness system
+         * later in fairness.js.
+         */
+
         let crashPoint =
             0.99 / (1 - random);
 
-        // Prevent extremely small values
+        // Minimum crash point
         crashPoint =
-            Math.max(1.00, crashPoint);
+            Math.max(1.01, crashPoint);
 
-        // Keep demo rounds reasonable
+        // Maximum demo crash point
         crashPoint =
-            Math.min(crashPoint, 1000);
+            Math.min(1000, crashPoint);
 
         return Number(
             crashPoint.toFixed(2)
@@ -64,20 +80,30 @@ class CrashGame {
         this.roundId++;
 
         this.status = "WAITING";
+
         this.multiplier = 1.00;
 
         this.crashPoint =
             this.generateCrashPoint();
 
         console.log(
-            `\nROUND ${this.roundId}`
+            "-----------------------------------"
+        );
+
+        console.log(
+            `ROUND ${this.roundId}`
         );
 
         console.log(
             `Crash point: ${this.crashPoint}x`
         );
 
+        console.log(
+            "-----------------------------------"
+        );
+
         this.broadcast({
+
             type: "ROUND_CREATED",
 
             data: {
@@ -86,6 +112,7 @@ class CrashGame {
                 multiplier: this.multiplier,
                 bettingTime: this.bettingTime
             }
+
         });
 
         this.startBettingCountdown();
@@ -102,28 +129,32 @@ class CrashGame {
         );
 
         this.broadcast({
+
             type: "BETTING_OPEN",
 
             data: {
                 roundId: this.roundId,
                 duration: this.bettingTime
             }
+
         });
 
-        this.roundTimer = setTimeout(() => {
+        this.roundTimer =
+            setTimeout(() => {
 
-            this.startRound();
+                this.startRound();
 
-        }, this.bettingTime);
+            }, this.bettingTime);
     }
 
     // ----------------------------------------
-    // START GAME
+    // START ROUND
     // ----------------------------------------
 
     startRound() {
 
         this.status = "RUNNING";
+
         this.multiplier = 1.00;
 
         console.log(
@@ -131,62 +162,81 @@ class CrashGame {
         );
 
         this.broadcast({
+
             type: "ROUND_STARTED",
 
             data: {
                 roundId: this.roundId,
                 multiplier: this.multiplier
             }
+
         });
 
-        const startTime = Date.now();
+        const startTime =
+            Date.now();
 
-        this.gameTimer = setInterval(() => {
+        this.gameTimer =
+            setInterval(() => {
 
-            const elapsed =
-                Date.now() - startTime;
+                const elapsed =
+                    Date.now() - startTime;
 
-            /*
-             * Exponential multiplier curve.
-             *
-             * This is only the demo game curve.
-             * Later we can tune the speed and
-             * animation independently.
-             */
+                /*
+                 * Multiplier growth.
+                 *
+                 * This controls the visual/game speed.
+                 */
 
-            this.multiplier =
-                Math.exp(elapsed / 10000);
+                this.multiplier =
+                    Math.exp(
+                        elapsed / 10000
+                    );
 
-            this.multiplier =
-                Number(
-                    this.multiplier.toFixed(2)
-                );
+                this.multiplier =
+                    Number(
+                        this.multiplier.toFixed(2)
+                    );
 
-            // Check crash
-            if (
-                this.multiplier >=
-                this.crashPoint
-            ) {
+                // --------------------------------
+                // CHECK CRASH
+                // --------------------------------
 
-                this.crash();
+                if (
+                    this.multiplier >=
+                    this.crashPoint
+                ) {
 
-                return;
-            }
+                    this.crash();
 
-            this.broadcast({
-                type: "MULTIPLIER_UPDATE",
-
-                data: {
-                    roundId: this.roundId,
-                    multiplier: this.multiplier
+                    return;
                 }
-            });
 
-        }, this.tickRate);
+                // --------------------------------
+                // SEND MULTIPLIER
+                // --------------------------------
+
+                this.broadcast({
+
+                    type:
+                        "MULTIPLIER_UPDATE",
+
+                    data: {
+
+                        roundId:
+                            this.roundId,
+
+                        multiplier:
+                            this.multiplier
+
+                    }
+
+                });
+
+            }, this.tickRate);
     }
 
     // ----------------------------------------
-    // CRASH
+    // CRASH ROUND
     // ----------------------------------------
 
     crash() {
@@ -203,15 +253,27 @@ class CrashGame {
         );
 
         this.broadcast({
-            type: "ROUND_CRASHED",
+
+            type:
+                "ROUND_CRASHED",
 
             data: {
-                roundId: this.roundId,
-                multiplier: this.crashPoint
+
+                roundId:
+                    this.roundId,
+
+                multiplier:
+                    this.crashPoint
+
             }
+
         });
 
-        // Give clients time to display crash
+        /*
+         * Wait three seconds before
+         * creating the next round.
+         */
+
         setTimeout(() => {
 
             this.startNewRound();
@@ -220,16 +282,24 @@ class CrashGame {
     }
 
     // ----------------------------------------
-    // GET CURRENT GAME STATE
+    // GET GAME STATE
     // ----------------------------------------
 
     getState() {
 
         return {
-            roundId: this.roundId,
-            status: this.status,
-            multiplier: this.multiplier
+
+            roundId:
+                this.roundId,
+
+            status:
+                this.status,
+
+            multiplier:
+                this.multiplier
+
         };
+
     }
 
     // ----------------------------------------
@@ -255,6 +325,7 @@ class CrashGame {
 
             this.gameTimer = null;
         }
+
     }
 
 }
