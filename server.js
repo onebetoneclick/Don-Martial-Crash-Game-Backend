@@ -4,6 +4,8 @@ const WebSocket = require("ws");
 const cors = require("cors");
 require("dotenv").config();
 
+const CrashGame = require("./src/gameEngine");
+
 const app = express();
 
 app.use(cors());
@@ -11,163 +13,240 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// Create HTTP server
+// ----------------------------------------
+// HTTP SERVER
+// ----------------------------------------
+
 const server = http.createServer(app);
 
-// Create WebSocket server
+// ----------------------------------------
+// WEBSOCKET SERVER
+// ----------------------------------------
+
 const wss = new WebSocket.Server({
     server
 });
 
-// Store connected players
+// Connected players
 const players = new Set();
 
-// Current game state
-let gameState = {
-    roundId: 0,
-    status: "WAITING",
-    multiplier: 1.00,
-    crashPoint: null
-};
-
-// -------------------------------------
-// BASIC API
-// -------------------------------------
-
-app.get("/", (req, res) => {
-    res.json({
-        success: true,
-        message: "Don Martial Crash Backend is running",
-        version: "1.0.0"
-    });
-});
-
-app.get("/api/game/status", (req, res) => {
-    res.json({
-        success: true,
-        game: gameState
-    });
-});
-
-// -------------------------------------
-// WEBSOCKET CONNECTION
-// -------------------------------------
-
-wss.on("connection", (socket) => {
-
-    console.log("New WebSocket connection");
-
-    players.add(socket);
-
-    // Send current game state immediately
-    socket.send(JSON.stringify({
-        type: "GAME_STATE",
-        data: gameState
-    }));
-
-    socket.on("message", (message) => {
-
-        try {
-
-            const data = JSON.parse(message);
-
-            console.log("Client message:", data);
-
-            if (data.type === "PING") {
-
-                socket.send(JSON.stringify({
-                    type: "PONG",
-                    timestamp: Date.now()
-                }));
-
-            }
-
-        } catch (error) {
-
-            socket.send(JSON.stringify({
-                type: "ERROR",
-                message: "Invalid message format"
-            }));
-
-        }
-
-    });
-
-    socket.on("close", () => {
-
-        console.log("WebSocket connection closed");
-
-        players.delete(socket);
-
-    });
-
-    socket.on("error", (error) => {
-
-        console.error("WebSocket error:", error);
-
-        players.delete(socket);
-
-    });
-
-});
-
-// -------------------------------------
+// ----------------------------------------
 // BROADCAST FUNCTION
-// -------------------------------------
+// ----------------------------------------
 
 function broadcast(data) {
 
-    const message = JSON.stringify(data);
+    const message =
+        JSON.stringify(data);
 
     players.forEach((socket) => {
 
-        if (socket.readyState === WebSocket.OPEN) {
+        if (
+            socket.readyState ===
+            WebSocket.OPEN
+        ) {
 
             socket.send(message);
 
         }
 
     });
-
 }
 
-// -------------------------------------
-// TEST GAME LOOP
-// -------------------------------------
+// ----------------------------------------
+// GAME ENGINE
+// ----------------------------------------
 
-let testMultiplier = 1.00;
+const game = new CrashGame(
+    broadcast
+);
 
-setInterval(() => {
+// ----------------------------------------
+// BASIC API
+// ----------------------------------------
 
-    testMultiplier += 0.01;
+app.get("/", (req, res) => {
 
-    gameState = {
-        roundId: 1,
-        status: "RUNNING",
-        multiplier: Number(testMultiplier.toFixed(2)),
-        crashPoint: null
-    };
+    res.json({
 
-    broadcast({
-        type: "MULTIPLIER_UPDATE",
-        data: {
-            multiplier: gameState.multiplier
+        success: true,
+
+        message:
+            "Don Martial Crash Backend is running",
+
+        version: "1.0.0",
+
+        websocket:
+            "wss://don-martial-crash-game-backend.onrender.com"
+    });
+});
+
+// ----------------------------------------
+// GAME STATUS API
+// ----------------------------------------
+
+app.get(
+    "/api/game/status",
+    (req, res) => {
+
+        res.json({
+
+            success: true,
+
+            game: game.getState()
+
+        });
+
+    }
+);
+
+// ----------------------------------------
+// WEBSOCKET CONNECTION
+// ----------------------------------------
+
+wss.on("connection", (socket) => {
+
+    console.log(
+        "New WebSocket player connected"
+    );
+
+    players.add(socket);
+
+    // Send current state
+    socket.send(
+        JSON.stringify({
+
+            type: "GAME_STATE",
+
+            data: game.getState()
+
+        })
+    );
+
+    // ------------------------------------
+    // CLIENT MESSAGE
+    // ------------------------------------
+
+    socket.on(
+        "message",
+        (message) => {
+
+            try {
+
+                const data =
+                    JSON.parse(message);
+
+                console.log(
+                    "Client message:",
+                    data
+                );
+
+                // Test connection
+                if (
+                    data.type === "PING"
+                ) {
+
+                    socket.send(
+                        JSON.stringify({
+
+                            type: "PONG",
+
+                            timestamp:
+                                Date.now()
+
+                        })
+                    );
+
+                }
+
+            } catch (error) {
+
+                console.error(
+                    "Invalid WebSocket message:",
+                    error.message
+                );
+
+                socket.send(
+                    JSON.stringify({
+
+                        type: "ERROR",
+
+                        message:
+                            "Invalid message format"
+
+                    })
+                );
+
+            }
+
         }
+    );
+
+    // ------------------------------------
+    // CONNECTION CLOSED
+    // ------------------------------------
+
+    socket.on("close", () => {
+
+        console.log(
+            "Player disconnected"
+        );
+
+        players.delete(socket);
+
     });
 
-}, 1000);
+    // ------------------------------------
+    // CONNECTION ERROR
+    // ------------------------------------
 
-// -------------------------------------
-// START SERVER
-// -------------------------------------
+    socket.on(
+        "error",
+        (error) => {
 
-server.listen(PORT, () => {
+            console.error(
+                "WebSocket error:",
+                error.message
+            );
 
-    console.log("-----------------------------------");
-    console.log("DON MARTIAL CRASH BACKEND");
-    console.log("-----------------------------------");
-    console.log(`HTTP Server: http://localhost:${PORT}`);
-    console.log(`WebSocket: ws://localhost:${PORT}`);
-    console.log("-----------------------------------");
+            players.delete(socket);
+
+        }
+    );
 
 });
+
+// ----------------------------------------
+// START SERVER
+// ----------------------------------------
+
+server.listen(
+    PORT,
+    () => {
+
+        console.log(
+            "-----------------------------------"
+        );
+
+        console.log(
+            "DON MARTIAL CRASH BACKEND"
+        );
+
+        console.log(
+            "-----------------------------------"
+        );
+
+        console.log(
+            `HTTP Server running on port ${PORT}`
+        );
+
+        console.log(
+            "WebSocket server is ready"
+        );
+
+        console.log(
+            "-----------------------------------"
+        );
+
+    }
+);
