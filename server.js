@@ -48,14 +48,14 @@ const PORT = process.env.PORT || 3000;
  *
  * 5 seconds = 5000 milliseconds.
  */
-const BETTING_TIME = 5000;
+const BETTING_TIME = 10000;
 
 
 /*
  * Small delay before creating the next round
  * after a crash.
  */
-const NEXT_ROUND_DELAY = 3000;
+const NEXT_ROUND_DELAY = 5000;
 
 
 /*
