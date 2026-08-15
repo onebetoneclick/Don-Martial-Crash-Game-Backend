@@ -1,27 +1,5 @@
 "use strict";
 
-/*
-=========================================================
- DON MARTIAL BIG ODD REST API
-=========================================================
-
-Public subscriber endpoints:
- GET /api/v1/big-odd/current
- GET /api/v1/big-odd/next
- GET /api/v1/big-odd/upcoming
- GET /api/v1/big-odd/today
- GET /api/v1/big-odd/history
-
-All public endpoints require an API key.
-
-Temporary backend verification endpoint:
- POST /api/v1/big-odd/test-publish
-
-It requires X-Admin-Key and is intended only to verify the
-WebSocket -> Big Odd Engine -> REST API pipeline.
-=========================================================
-*/
-
 const engine = require("./big-odd-engine");
 const apiKeys = require("./api-key-manager");
 
@@ -40,6 +18,8 @@ function isAdmin(req) {
 }
 
 function sendJson(res, statusCode, payload) {
+    if (res.headersSent) return;
+
     res.writeHead(statusCode, {
         "Content-Type": "application/json; charset=utf-8",
         "Cache-Control": "no-store",
@@ -77,6 +57,7 @@ function handleBigOddRequest(req, res, pathname) {
         }
 
         let body = "";
+
         req.on("data", chunk => {
             body += chunk.toString();
             if (body.length > 10000) req.destroy();
@@ -84,6 +65,7 @@ function handleBigOddRequest(req, res, pathname) {
 
         req.on("end", () => {
             let input = {};
+
             try {
                 input = body ? JSON.parse(body) : {};
             } catch {
@@ -94,17 +76,33 @@ function handleBigOddRequest(req, res, pathname) {
                 return;
             }
 
+            if (!input || typeof input !== "object" || Array.isArray(input)) {
+                sendJson(res, 400, {
+                    success: false,
+                    error: "INVALID_REQUEST_BODY"
+                });
+                return;
+            }
+
+            // Accept all names used by the WebSocket/game server.
+            const odd =
+                input.odd ??
+                input.bigOdd ??
+                input.multiplier ??
+                input.crashMultiplier;
+
             const result = engine.publishTestOdd({
-                odd: input.odd,
-                roundId: input.roundId,
-                status: input.status || null
+                ...input,
+                odd
             });
 
             if (result && result.error) {
                 sendJson(res, 400, {
                     success: false,
                     error: result.error,
-                    minimum: result.minimum
+                    minimum: result.minimum,
+                    received: result.received,
+                    message: result.message || "Big Odd value is invalid."
                 });
                 return;
             }
