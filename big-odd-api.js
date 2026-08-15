@@ -5,21 +5,20 @@
  DON MARTIAL BIG ODD REST API
 =========================================================
 
-Endpoints:
+Public subscriber endpoints:
  GET /api/v1/big-odd/current
  GET /api/v1/big-odd/next
  GET /api/v1/big-odd/upcoming
  GET /api/v1/big-odd/today
  GET /api/v1/big-odd/history
 
-All endpoints require an API key.
-The API key is supplied with:
-  x-api-key: YOUR_KEY
-or:
-  Authorization: Bearer YOUR_KEY
+All public endpoints require an API key.
 
-API keys may be generated with:
-  POST /api/v1/api-key
+Temporary backend verification endpoint:
+ POST /api/v1/big-odd/test-publish
+
+It requires X-Admin-Key and is intended only to verify the
+WebSocket -> Big Odd Engine -> REST API pipeline.
 =========================================================
 */
 
@@ -34,6 +33,12 @@ function isAuthorized(req) {
     return apiKeys.isValidApiKey(getApiKey(req));
 }
 
+function isAdmin(req) {
+    const configured = String(process.env.BIG_ODD_ADMIN_KEY || "").trim();
+    const supplied = String(req.headers["x-admin-key"] || "").trim();
+    return Boolean(configured && supplied && supplied === configured);
+}
+
 function sendJson(res, statusCode, payload) {
     res.writeHead(statusCode, {
         "Content-Type": "application/json; charset=utf-8",
@@ -44,17 +49,76 @@ function sendJson(res, statusCode, payload) {
 }
 
 function handleBigOddRequest(req, res, pathname) {
-    if (!pathname.startsWith("/api/v1/big-odd/")) {
-        return false;
-    }
+    if (!pathname.startsWith("/api/v1/big-odd/")) return false;
 
     if (req.method === "OPTIONS") {
         res.writeHead(204, {
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key"
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key, X-Admin-Key"
         });
         res.end();
+        return true;
+    }
+
+    if (pathname === "/api/v1/big-odd/test-publish") {
+        if (req.method !== "POST") {
+            sendJson(res, 405, { success: false, error: "METHOD_NOT_ALLOWED" });
+            return true;
+        }
+
+        if (!isAdmin(req)) {
+            sendJson(res, 401, {
+                success: false,
+                error: "INVALID_ADMIN_KEY",
+                message: "A valid admin key is required for the test publisher."
+            });
+            return true;
+        }
+
+        let body = "";
+        req.on("data", chunk => {
+            body += chunk.toString();
+            if (body.length > 10000) req.destroy();
+        });
+
+        req.on("end", () => {
+            let input = {};
+            try {
+                input = body ? JSON.parse(body) : {};
+            } catch {
+                sendJson(res, 400, {
+                    success: false,
+                    error: "INVALID_JSON"
+                });
+                return;
+            }
+
+            const result = engine.publishTestOdd({
+                odd: input.odd,
+                roundId: input.roundId,
+                status: input.status || null
+            });
+
+            if (result && result.error) {
+                sendJson(res, 400, {
+                    success: false,
+                    error: result.error,
+                    minimum: result.minimum
+                });
+                return;
+            }
+
+            sendJson(res, 201, {
+                success: true,
+                type: "test-publish",
+                message: "Test Big Odd published to the engine.",
+                serverTime: new Date().toISOString(),
+                data: result,
+                stats: engine.getStats()
+            });
+        });
+
         return true;
     }
 
@@ -83,27 +147,22 @@ function handleBigOddRequest(req, res, pathname) {
             type = "current";
             data = engine.getCurrent();
             break;
-
         case "/api/v1/big-odd/next":
             type = "next";
             data = engine.getNext();
             break;
-
         case "/api/v1/big-odd/upcoming":
             type = "upcoming";
             data = engine.getUpcoming();
             break;
-
         case "/api/v1/big-odd/today":
             type = "today";
             data = engine.getToday();
             break;
-
         case "/api/v1/big-odd/history":
             type = "history";
             data = engine.getHistory();
             break;
-
         default:
             sendJson(res, 404, {
                 success: false,
