@@ -24,20 +24,16 @@ function numberFrom(value) {
             ? value.trim().replace(/x$/i, "")
             : value
     );
-
     return Number.isFinite(number) ? number : NaN;
 }
 
 function payloadOf(message) {
     if (!message || typeof message !== "object") return null;
-    return message.data && typeof message.data === "object"
-        ? message.data
-        : null;
+    return message.data && typeof message.data === "object" ? message.data : null;
 }
 
 function oddOf(payload) {
     if (!payload) return NaN;
-
     return numberFrom(
         payload.crashMultiplier ??
         payload.bigOdd ??
@@ -48,9 +44,7 @@ function oddOf(payload) {
 
 function findRound(roundId) {
     const id = Number(roundId);
-
     if (!Number.isFinite(id)) return null;
-
     return bigOddEngine
         .getHistory()
         .find(item => Number(item.roundId) === id) || null;
@@ -60,49 +54,45 @@ function publish(payload) {
     if (!payload || payload.roundId === undefined) return null;
 
     const odd = oddOf(payload);
-
-    /*
-     * Only the special Big Odd rounds are published.
-     * Normal rounds below the configured minimum are ignored.
-     */
-    if (
-        !Number.isFinite(odd) ||
-        odd < bigOddEngine.BIG_ODD_MINIMUM
-    ) {
-        return null;
-    }
+    if (!Number.isFinite(odd) || odd < bigOddEngine.BIG_ODD_MINIMUM) return null;
 
     const existing = findRound(payload.roundId);
+    if (existing) return existing;
 
-    if (existing) {
-        return existing;
-    }
-
-    const record =
-        bigOddEngine.publishFromRound({
-            roundId: payload.roundId,
-            odd,
-            crashMultiplier: odd,
-            status: payload.status || null,
-            createdAt:
-                payload.createdAt ||
-                payload.serverTime ||
-                new Date().toISOString(),
-            serverTime:
-                payload.serverTime ||
-                new Date().toISOString(),
-            startedAt:
-                payload.startedAt || null,
-            crashedAt:
-                payload.crashedAt || null
-        });
+    const record = bigOddEngine.publishFromRound({
+        roundId: payload.roundId,
+        odd,
+        crashMultiplier: odd,
+        status: payload.status || null,
+        createdAt: payload.createdAt || payload.serverTime || new Date().toISOString(),
+        serverTime: payload.serverTime || new Date().toISOString(),
+        startedAt: payload.startedAt || null,
+        crashedAt: payload.crashedAt || null
+    });
 
     if (record) {
         lastPublishedAt = new Date().toISOString();
         lastPublishedRoundId = record.roundId;
-
         console.log(
-            `[BIG ODD] Published round ${payload.roundId} -> ${record.odd.toFixed(2)}x`
+            `[BIG ODD] Published live round ${payload.roundId} -> ${record.odd.toFixed(2)}x`
+        );
+    }
+
+    return record;
+}
+
+function bindScheduledRound(payload) {
+    if (!payload || payload.roundId === undefined) return null;
+
+    const startedAt = payload.startedAt || payload.serverTime || new Date().toISOString();
+    const record = bigOddEngine.bindScheduledToRound(
+        payload.roundId,
+        startedAt
+    );
+
+    if (record) {
+        console.log(
+            `[BIG ODD] Scheduled ${record.id} bound to round ${record.roundId} at ${startedAt}`
         );
     }
 
@@ -111,7 +101,6 @@ function publish(payload) {
 
 function ensurePublished(payload) {
     if (!payload || payload.roundId === undefined) return null;
-
     return findRound(payload.roundId) || publish(payload);
 }
 
@@ -119,48 +108,30 @@ function processMessage(message) {
     if (!message || typeof message !== "object") return;
 
     lastMessageAt = new Date().toISOString();
-
     const payload = payloadOf(message);
-
     if (!payload) return;
 
-    if (
-        message.type === "CONNECTED" &&
-        payload.game
-    ) {
-        processMessage({
-            type: "GAME_STATE",
-            data: payload.game
-        });
-
+    if (message.type === "CONNECTED" && payload.game) {
+        processMessage({ type: "GAME_STATE", data: payload.game });
         return;
     }
 
     if (message.type === "GAME_STATE") {
         const odd = oddOf(payload);
 
-        if (
-            !Number.isFinite(odd) ||
-            odd < bigOddEngine.BIG_ODD_MINIMUM
-        ) {
-            return;
-        }
-
         if (payload.status === "RUNNING") {
-            const record = ensurePublished(payload);
+            const scheduled = bindScheduledRound(payload);
+            const record = scheduled || ensurePublished(payload);
 
             if (record) {
                 bigOddEngine.updateRoundStatus(
                     payload.roundId,
                     "RUNNING",
                     {
-                        runningAt:
-                            payload.startedAt ||
-                            payload.serverTime
+                        runningAt: payload.startedAt || payload.serverTime
                     }
                 );
             }
-
             return;
         }
 
@@ -172,40 +143,44 @@ function processMessage(message) {
                     payload.roundId,
                     "PLAYED",
                     {
-                        playedAt:
-                            payload.crashedAt ||
-                            payload.serverTime
+                        playedAt: payload.crashedAt || payload.serverTime
                     }
                 );
             }
-
             return;
         }
 
-        publish(payload);
+        // Only publish normal WebSocket rounds when they themselves
+        // qualify as a Big Odd. Scheduled items are already published
+        // by the daily scheduler one hour before their slot.
+        if (
+            Number.isFinite(odd) &&
+            odd >= bigOddEngine.BIG_ODD_MINIMUM
+        ) {
+            publish(payload);
+        }
         return;
     }
 
     if (message.type === "ROUND_CREATED") {
-        publish(payload);
+        // Do not publish here. A round is not a Big Odd merely because
+        // it was created; the scheduled publisher handles announcements.
         return;
     }
 
     if (message.type === "ROUND_STARTED") {
-        const record = ensurePublished(payload);
+        const scheduled = bindScheduledRound(payload);
+        const record = scheduled || ensurePublished(payload);
 
         if (record) {
             bigOddEngine.updateRoundStatus(
                 payload.roundId,
                 "RUNNING",
                 {
-                    runningAt:
-                        payload.startedAt ||
-                        payload.serverTime
+                    runningAt: payload.startedAt || payload.serverTime
                 }
             );
         }
-
         return;
     }
 
@@ -217,46 +192,26 @@ function processMessage(message) {
                 payload.roundId,
                 "PLAYED",
                 {
-                    playedAt:
-                        payload.crashedAt ||
-                        payload.serverTime
+                    playedAt: payload.crashedAt || payload.serverTime
                 }
             );
         }
     }
 }
 
-/*
- * Render/local WebSocket can occasionally start slightly before
- * the bridge. This HTTP synchronization gives the bridge a second
- * reliable way to recover the current WebSocket game state without
- * changing the source of the data: it is still the crash server.
- */
 async function syncCurrentGame() {
     if (!installed) return;
 
     try {
         const response = await fetch(GAME_URL, {
-            headers: {
-                "Accept": "application/json"
-            }
+            headers: { Accept: "application/json" }
         });
 
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-        }
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
         const body = await response.json();
-
-        if (
-            body &&
-            body.success &&
-            body.game
-        ) {
-            processMessage({
-                type: "GAME_STATE",
-                data: body.game
-            });
+        if (body && body.success && body.game) {
+            processMessage({ type: "GAME_STATE", data: body.game });
         }
 
         lastError = null;
@@ -267,18 +222,12 @@ async function syncCurrentGame() {
 
 function startSyncLoop() {
     if (syncTimer) return;
-
     syncCurrentGame();
-
-    syncTimer = setInterval(
-        syncCurrentGame,
-        SYNC_INTERVAL
-    );
+    syncTimer = setInterval(syncCurrentGame, SYNC_INTERVAL);
 }
 
 function scheduleReconnect() {
     if (!installed || reconnectTimer) return;
-
     reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
         connect();
@@ -294,60 +243,37 @@ function connect() {
             socket.readyState === WebSocket.OPEN ||
             socket.readyState === WebSocket.CONNECTING
         )
-    ) {
-        return;
-    }
+    ) return;
 
-    console.log(
-        `[BIG ODD] Connecting bridge to ${BRIDGE_URL}`
-    );
+    console.log(`[BIG ODD] Connecting bridge to ${BRIDGE_URL}`);
 
     try {
         socket = new WebSocket(BRIDGE_URL);
     } catch (error) {
         lastError = error.message;
-
-        console.error(
-            "[BIG ODD] Bridge connection failed:",
-            error.message
-        );
-
+        console.error("[BIG ODD] Bridge connection failed:", error.message);
         scheduleReconnect();
         return;
     }
 
     socket.on("open", () => {
         lastError = null;
-
-        console.log(
-            "[BIG ODD] Bridge connected to crash WebSocket"
-        );
-
+        console.log("[BIG ODD] Bridge connected to crash WebSocket");
         syncCurrentGame();
     });
 
     socket.on("message", raw => {
         try {
-            processMessage(
-                JSON.parse(raw.toString())
-            );
+            processMessage(JSON.parse(raw.toString()));
         } catch (error) {
             lastError = error.message;
-
-            console.warn(
-                "[BIG ODD] Invalid bridge message:",
-                error.message
-            );
+            console.warn("[BIG ODD] Invalid bridge message:", error.message);
         }
     });
 
     socket.on("error", error => {
         lastError = error.message;
-
-        console.error(
-            "[BIG ODD] Bridge error:",
-            error.message
-        );
+        console.error("[BIG ODD] Bridge error:", error.message);
     });
 
     socket.on("close", () => {
@@ -359,9 +285,7 @@ function connect() {
 function getStatus() {
     return {
         installed,
-        websocketConnected:
-            !!socket &&
-            socket.readyState === WebSocket.OPEN,
+        websocketConnected: !!socket && socket.readyState === WebSocket.OPEN,
         bridgeUrl: BRIDGE_URL,
         gameUrl: GAME_URL,
         minimumBigOdd: bigOddEngine.BIG_ODD_MINIMUM,
@@ -374,7 +298,6 @@ function getStatus() {
 
 function install() {
     if (installed) return;
-
     installed = true;
 
     console.log(
