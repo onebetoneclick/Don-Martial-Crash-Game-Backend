@@ -5,16 +5,19 @@
  DON MARTIAL BIG ODD WEBSOCKET BRIDGE
 =========================================================
 
-Connects the crash-game WebSocket events to the Big Odd
-Engine.
+Consumes the crash server's outgoing WebSocket events and
+publishes qualifying crash multipliers (>= BIG_ODD_MINIMUM)
+to the Big Odd engine.
 
-The bridge is deliberately tolerant of the public payload:
-if ROUND_CREATED does not expose crashMultiplier, the bridge
-will also try ROUND_STARTED and ROUND_CRASHED.
+Important:
+- This is an internal bridge; it does not create a second
+  WebSocket server.
+- It watches the exact messages the crash server broadcasts.
+- ROUND_STARTED and ROUND_CRASHED are fallbacks when the
+  earlier event does not contain the multiplier.
 =========================================================
 */
 
-const WebSocket = require("ws");
 const bigOddEngine = require("./big-odd-engine");
 
 let installed = false;
@@ -62,7 +65,9 @@ function publishCreatedRound(payload) {
         crashMultiplier: odd,
         status: payload.status || "WAITING",
         createdAt: payload.createdAt || payload.serverTime,
-        serverTime: payload.serverTime
+        serverTime: payload.serverTime,
+        startedAt: payload.startedAt,
+        crashedAt: payload.crashedAt
     });
 
     if (record) {
@@ -75,21 +80,25 @@ function publishCreatedRound(payload) {
 }
 
 function ensurePublished(payload) {
-    const existing = bigOddEngine
-        .getHistory()
-        .find(item => Number(item.roundId) === Number(payload.roundId));
+    const roundId = Number(payload.roundId);
 
-    if (existing) return existing;
+    if (Number.isFinite(roundId)) {
+        const existing = bigOddEngine
+            .getHistory()
+            .find(item => Number(item.roundId) === roundId);
+
+        if (existing) return existing;
+    }
 
     return publishCreatedRound(payload);
 }
 
 function markRunning(payload) {
-    /*
-     * ROUND_STARTED is a fallback source because the crash
-     * multiplier is exposed by the game server here.
-     */
     const published = ensurePublished(payload);
+
+    if (!published) {
+        return;
+    }
 
     const record = bigOddEngine.updateRoundStatus(
         payload.roundId,
@@ -102,7 +111,7 @@ function markRunning(payload) {
         }
     );
 
-    if (record || published) {
+    if (record) {
         console.log(
             `[BIG ODD] Round ${payload.roundId} -> running`
         );
@@ -110,11 +119,11 @@ function markRunning(payload) {
 }
 
 function markPlayed(payload) {
-    /*
-     * Final fallback: if the earlier WebSocket event did not
-     * contain the odd, try the crash event before marking it.
-     */
     const published = ensurePublished(payload);
+
+    if (!published) {
+        return;
+    }
 
     const record = bigOddEngine.updateRoundStatus(
         payload.roundId,
@@ -127,14 +136,14 @@ function markPlayed(payload) {
         }
     );
 
-    if (record || published) {
+    if (record) {
         console.log(
             `[BIG ODD] Round ${payload.roundId} -> played`
         );
     }
 }
 
-function handleWebSocketMessage(message) {
+function processMessage(message) {
     if (!message || typeof message !== "object") return;
 
     const payload = getPayload(message);
@@ -162,16 +171,35 @@ function install() {
     if (installed) return;
     installed = true;
 
+    /*
+     * Keep the existing WebSocket bridge, but make the hook
+     * defensive and non-blocking. ws sends strings in our
+     * crash server, so only JSON strings are inspected.
+     */
+    let WebSocket;
+
+    try {
+        WebSocket = require("ws");
+    } catch (error) {
+        console.error("[BIG ODD] Could not load ws:", error.message);
+        return;
+    }
+
     const originalSend = WebSocket.prototype.send;
+
+    if (typeof originalSend !== "function") {
+        console.error("[BIG ODD] WebSocket.send was not found.");
+        return;
+    }
 
     WebSocket.prototype.send = function bigOddBridgeSend(data, ...args) {
         try {
             if (typeof data === "string") {
-                handleWebSocketMessage(JSON.parse(data));
+                processMessage(JSON.parse(data));
             }
         } catch (error) {
             console.warn(
-                "[BIG ODD] Bridge ignored invalid WebSocket message:",
+                "[BIG ODD] Bridge ignored outgoing message:",
                 error.message
             );
         }
@@ -185,5 +213,6 @@ function install() {
 }
 
 module.exports = {
-    install
+    install,
+    processMessage
 };
