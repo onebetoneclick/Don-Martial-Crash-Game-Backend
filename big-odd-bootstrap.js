@@ -5,40 +5,29 @@
  DON MARTIAL BIG ODD BOOTSTRAP
 =========================================================
 
-This file connects the existing crash-game server to the
-Big Odd REST API without replacing the current game server.
+Loads the Big Odd REST API, API-key manager, and the live
+WebSocket -> Big Odd bridge before server.js creates its
+HTTP/WebSocket server.
 
-It does three jobs:
-1. Adds /api/v1/big-odd/* routes to the existing HTTP server.
-2. Adds POST /api/v1/api-key for secure API-key generation.
-3. Bridges WebSocket round events into the Big Odd Engine.
+FLOW:
 
-BIG ODD FLOW:
-
-WebSocket generates round + crash odd
-        ↓
-ROUND_CREATED
-        ↓
-Big Odd Engine stores it as status: null
-        ↓
-REST /upcoming and /today can see it
-        ↓
-ROUND_STARTED
-        ↓
-status: running
-        ↓
-ROUND_CRASHED
-        ↓
-status: played
+Crash WebSocket
+      ↓
+Big Odd WebSocket Bridge
+      ↓
+Big Odd Engine
+      ↓
+Big Odd REST API
+      ↓
+mt_live_ API key
 =========================================================
 */
 
 const http = require("http");
-const WebSocket = require("ws");
 
 const bigOddApi = require("./big-odd-api");
-const bigOddEngine = require("./big-odd-engine");
 const apiKeyManager = require("./api-key-manager");
+const bigOddWebSocketBridge = require("./big-odd-websocket-bridge");
 
 /* =====================================================
    HTTP ROUTE INTEGRATION
@@ -94,82 +83,9 @@ http.createServer = function patchedCreateServer(...args) {
 };
 
 /* =====================================================
-   WEBSOCKET BIG ODD BRIDGE
+   INSTALL LIVE WEBSOCKET BRIDGE
 ===================================================== */
 
-const originalSend = WebSocket.prototype.send;
-
-WebSocket.prototype.send = function patchedSend(data, ...args) {
-    try {
-        if (typeof data === "string") {
-            const message = JSON.parse(data);
-            const payload = message && message.data;
-
-            if (payload && message.type === "ROUND_CREATED") {
-                const crashMultiplier = Number(payload.crashMultiplier);
-
-                if (
-                    Number.isFinite(crashMultiplier) &&
-                    crashMultiplier >= bigOddEngine.BIG_ODD_MINIMUM
-                ) {
-                    const record = bigOddEngine.publishFromRound({
-                        roundId: payload.roundId,
-                        status: payload.status || "WAITING",
-                        crashMultiplier,
-                        createdAt: payload.createdAt || payload.serverTime,
-                        serverTime: payload.serverTime
-                    });
-
-                    if (record) {
-                        console.log(
-                            `[BIG ODD] Generated round ${payload.roundId} at ${crashMultiplier.toFixed(2)}x`
-                        );
-                    }
-                }
-            }
-
-            if (payload && message.type === "ROUND_STARTED") {
-                const record = bigOddEngine.updateRoundStatus(
-                    payload.roundId,
-                    "RUNNING",
-                    {
-                        runningAt:
-                            payload.serverTime ||
-                            new Date().toISOString()
-                    }
-                );
-
-                if (record) {
-                    console.log(
-                        `[BIG ODD] Round ${payload.roundId} is now running`
-                    );
-                }
-            }
-
-            if (payload && message.type === "ROUND_CRASHED") {
-                const record = bigOddEngine.updateRoundStatus(
-                    payload.roundId,
-                    "CRASHED",
-                    {
-                        playedAt:
-                            payload.crashedAt ||
-                            payload.serverTime ||
-                            new Date().toISOString()
-                    }
-                );
-
-                if (record) {
-                    console.log(
-                        `[BIG ODD] Round ${payload.roundId} marked played`
-                    );
-                }
-            }
-        }
-    } catch {
-        // Ignore non-JSON WebSocket messages and continue normally.
-    }
-
-    return originalSend.call(this, data, ...args);
-};
+bigOddWebSocketBridge.install();
 
 console.log("[BIG ODD] Bootstrap loaded");
