@@ -1,31 +1,12 @@
 "use strict";
 
-/*
-=========================================================
- DON MARTIAL BIG ODD ENGINE
-=========================================================
-
-The WebSocket/game server generates the crash multiplier.
-Qualifying rounds are published here immediately.
-
-Lifecycle:
-  WAITING / BETTING -> status: null (upcoming)
-  RUNNING           -> status: running
-  CRASHED           -> status: played
-
-The engine accepts the normal WebSocket round shape and the
-protected test publisher shape.
-=========================================================
-*/
-
 const MAX_HISTORY = 1000;
 const BIG_ODD_MINIMUM = Number(process.env.BIG_ODD_MINIMUM || 10);
-
 const records = [];
 let sequence = 0;
 
 function todayKey(date = new Date()) {
-    return date.toISOString().slice(0, 10);
+    return new Date(date).toISOString().slice(0, 10);
 }
 
 function makeId() {
@@ -34,59 +15,70 @@ function makeId() {
 }
 
 function normalizeStatus(status) {
-    if (status === "played" || status === "PLAYED" || status === "CRASHED") return "played";
-    if (status === "running" || status === "RUNNING") return "running";
+    const value = String(status ?? "").trim().toUpperCase();
+    if (value === "RUNNING") return "running";
+    if (value === "PLAYED" || value === "CRASHED") return "played";
     return null;
 }
 
-function getOddValue(round) {
-    if (!round || typeof round !== "object") return NaN;
+function readOdd(input) {
+    if (!input || typeof input !== "object") return NaN;
 
     const candidates = [
-        round.crashMultiplier,
-        round.odd,
-        round.multiplier,
-        round.bigOdd
+        input.odd,
+        input.bigOdd,
+        input.multiplier,
+        input.crashMultiplier
     ];
 
-    for (const value of candidates) {
-        if (value !== undefined && value !== null && String(value).trim() !== "") {
-            const number = Number(value);
-            if (Number.isFinite(number)) return number;
-        }
+    for (const candidate of candidates) {
+        if (candidate === null || candidate === undefined || String(candidate).trim() === "") continue;
+        const value = Number(String(candidate).trim().replace(/x$/i, ""));
+        if (Number.isFinite(value)) return value;
     }
 
     return NaN;
 }
 
 function publishFromRound(round) {
-    if (!round) return null;
+    if (!round || typeof round !== "object") return null;
 
-    const multiplier = getOddValue(round);
+    const multiplier = readOdd(round);
+    if (!Number.isFinite(multiplier) || multiplier < BIG_ODD_MINIMUM) return null;
 
-    if (!Number.isFinite(multiplier) || multiplier < BIG_ODD_MINIMUM) {
-        return null;
-    }
-
-    const rawRoundId = round.roundId;
-    const roundId = Number(rawRoundId);
+    const numericRoundId = Number(round.roundId);
+    const hasRoundId = Number.isFinite(numericRoundId);
+    const suppliedId = String(round.bigOddId || "").trim();
 
     const duplicate = records.find(item =>
-        (Number.isFinite(roundId) && Number(item.roundId) === roundId) ||
-        (round.bigOddId && item.id === round.bigOddId)
+        (hasRoundId && Number(item.roundId) === numericRoundId) ||
+        (suppliedId && item.id === suppliedId)
     );
 
-    if (duplicate) return duplicate;
+    if (duplicate) {
+        const status = normalizeStatus(round.status);
+
+        if (status === "running") {
+            duplicate.status = "running";
+            duplicate.runningAt = round.startedAt || round.serverTime || duplicate.runningAt;
+        } else if (status === "played") {
+            duplicate.status = "played";
+            duplicate.playedAt = round.crashedAt || round.serverTime || duplicate.playedAt;
+        }
+
+        duplicate.serverTime = new Date().toISOString();
+        return duplicate;
+    }
 
     const createdAt = round.createdAt || round.serverTime || new Date().toISOString();
     const status = normalizeStatus(round.status);
 
     const record = {
-        id: round.bigOddId || makeId(),
-        roundId: Number.isFinite(roundId) ? roundId : null,
+        id: suppliedId || makeId(),
+        roundId: hasRoundId ? numericRoundId : null,
         odd: Number(multiplier.toFixed(2)),
         status,
-        date: todayKey(new Date(createdAt)),
+        date: todayKey(createdAt),
         createdAt,
         runningAt: status === "running" ? (round.startedAt || round.serverTime || null) : null,
         playedAt: status === "played" ? (round.crashedAt || round.serverTime || null) : null,
@@ -94,40 +86,32 @@ function publishFromRound(round) {
     };
 
     records.unshift(record);
-
-    if (records.length > MAX_HISTORY) {
-        records.length = MAX_HISTORY;
-    }
-
+    if (records.length > MAX_HISTORY) records.length = MAX_HISTORY;
     return record;
 }
 
 function publishTestOdd(input = {}) {
-    const odd = input.odd ?? input.multiplier ?? input.bigOdd ?? input.crashMultiplier;
-    const multiplier = Number(odd);
+    const multiplier = readOdd(input);
 
     if (!Number.isFinite(multiplier) || multiplier < BIG_ODD_MINIMUM) {
         return {
             error: "INVALID_BIG_ODD",
             minimum: BIG_ODD_MINIMUM,
-            received: odd ?? null,
+            received: input.odd ?? input.bigOdd ?? input.multiplier ?? input.crashMultiplier ?? null,
             message: `Big Odd must be a number greater than or equal to ${BIG_ODD_MINIMUM}.`
         };
     }
 
     const numericRoundId = Number(input.roundId);
-    const id = Number.isFinite(numericRoundId)
-        ? numericRoundId
-        : `TEST-${Date.now()}`;
-
+    const roundId = Number.isFinite(numericRoundId) ? numericRoundId : `TEST-${Date.now()}`;
     const now = new Date().toISOString();
     const status = normalizeStatus(input.status);
 
     return publishFromRound({
-        roundId: id,
-        crashMultiplier: multiplier,
+        roundId,
+        odd: multiplier,
         status,
-        createdAt: now,
+        createdAt: input.createdAt || now,
         serverTime: now,
         startedAt: status === "running" ? now : null,
         crashedAt: status === "played" ? now : null
@@ -137,7 +121,6 @@ function publishTestOdd(input = {}) {
 function updateRoundStatus(roundId, status, extra = {}) {
     const id = Number(roundId);
     const record = records.find(item => Number(item.roundId) === id);
-
     if (!record) return null;
 
     const normalized = normalizeStatus(status);
@@ -179,7 +162,6 @@ function getHistory() {
 
 function getStats() {
     const today = getToday();
-
     return {
         total: records.length,
         today: today.length,
