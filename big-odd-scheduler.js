@@ -5,15 +5,17 @@
  DON MARTIAL BIG ODD DAILY SCHEDULER
 =========================================================
 
-Creates the day's Big Odd plan early in the day, keeps the
-plan private until its publication time, then publishes each
-item to the existing Big Odd engine one hour before its
-scheduled time.
+Creates one complete Big Odd schedule for the current UTC day.
+Each Big Odd has its own odd, scheduled time and publication time.
+A Big Odd is published to the engine PUBLISH_MINUTES before it is
+scheduled to run.
+
+The scheduled time may be ANY time during the 24-hour day.
+The scheduler never targets a fixed hour for the actual Big Odd.
 
 IMPORTANT:
-This scheduler is for the DEMO/TEST crash server. It does not
-change the live crash result. The crash server remains the
-source of the actual round outcome.
+This scheduler prepares/announces DEMO/TEST Big Odds. The WebSocket
+server remains the source of the actual crash-round lifecycle.
 =========================================================
 */
 
@@ -46,12 +48,12 @@ function randomOdd() {
     return Number(value.toFixed(2));
 }
 
-function randomTimeForDay(dateKeyValue, index) {
-    const start = new Date(`${dateKeyValue}T00:00:00.000Z`).getTime();
+function randomTimeForDay(day, index) {
+    const start = new Date(`${day}T00:00:00.000Z`).getTime();
     const end = start + (24 * 60 * 60 * 1000) - 1;
 
-    // Use a deterministic spread first, then add jitter so the
-    // daily schedule is distributed over the full 24-hour day.
+    // Spread the daily Big Odds across the entire 24-hour period,
+    // then add jitter so the times are not fixed.
     const slot = (index + 0.5) / DAILY_COUNT;
     const jitter = (Math.random() - 0.5) * (0.70 / DAILY_COUNT);
     const ratio = Math.min(0.999, Math.max(0.001, slot + jitter));
@@ -68,8 +70,10 @@ function makePlanForDate(day) {
             scheduledAtDate.getTime() - (PUBLISH_MINUTES * 60 * 1000)
         );
 
+        const id = `BO-${day}-PLAN-${String(i + 1).padStart(2, "0")}-${crypto.randomBytes(3).toString("hex")}`;
+
         items.push({
-            id: `BO-${day}-PLAN-${String(i + 1).padStart(2, "0")}-${crypto.randomBytes(3).toString("hex")}`,
+            id,
             odd: randomOdd(),
             scheduledAt: scheduledAtDate.toISOString(),
             publishAt: publishAtDate.toISOString(),
@@ -85,14 +89,14 @@ function shouldCreatePlan(now = new Date()) {
     const today = dateKey(now);
     if (plannedDate === today && plan.length > 0) return false;
 
-    const hour = now.getUTCHours();
-    return hour >= PLAN_HOUR || plannedDate !== today;
+    // PLAN_HOUR controls when the daily plan is first created after
+    // startup/midnight. It does NOT control the actual Big Odd times.
+    return now.getUTCHours() >= PLAN_HOUR || plannedDate !== today;
 }
 
 function createDailyPlan(now = new Date()) {
     const today = dateKey(now);
 
-    // Do not replace a plan that is already active for today.
     if (plannedDate === today && plan.length > 0) return plan;
 
     plan = makePlanForDate(today);
@@ -100,9 +104,13 @@ function createDailyPlan(now = new Date()) {
     lastPlanAt = new Date().toISOString();
     lastError = null;
 
-    console.log(
-        `[BIG ODD] Daily plan created for ${today}: ${plan.length} Big Odd slots.`
-    );
+    console.log(`[BIG ODD] Daily plan created for ${today}: ${plan.length} Big Odds.`);
+
+    for (const item of plan) {
+        console.log(
+            `[BIG ODD] ${item.id} | ${item.odd.toFixed(2)}x | scheduled ${item.scheduledAt} | publish ${item.publishAt}`
+        );
+    }
 
     return plan;
 }
@@ -117,31 +125,43 @@ function publishDueItems(now = new Date()) {
         if (!Number.isFinite(publishAtMs) || nowMs < publishAtMs) continue;
 
         try {
+            const publishedAt = new Date().toISOString();
+
             const record = engine.publishFromRound({
+                // IMPORTANT: this plan ID is the immutable identity of this
+                // particular Big Odd. Never reuse another plan's ID.
                 bigOddId: item.id,
                 roundId: null,
                 odd: item.odd,
                 status: null,
-                createdAt: new Date().toISOString(),
+                createdAt: publishedAt,
                 scheduledAt: item.scheduledAt,
                 publishAt: item.publishAt,
-                publishedAt: new Date().toISOString(),
-                serverTime: new Date().toISOString(),
+                publishedAt,
+                serverTime: publishedAt,
                 date: plannedDate
             });
 
-            if (record) {
-                item.published = true;
-                item.publishedRecordId = record.id;
-                lastPublishedAt = new Date().toISOString();
+            if (!record) {
+                throw new Error(`Engine rejected scheduled Big Odd ${item.id}`);
+            }
 
-                console.log(
-                    `[BIG ODD] Published ${record.id}: ${record.odd.toFixed(2)}x for ${record.scheduledAt}`
+            if (record.id !== item.id) {
+                throw new Error(
+                    `Big Odd identity mismatch: expected ${item.id}, received ${record.id}`
                 );
             }
+
+            item.published = true;
+            item.publishedRecordId = record.id;
+            lastPublishedAt = publishedAt;
+
+            console.log(
+                `[BIG ODD] Published ${record.id}: ${record.odd.toFixed(2)}x | scheduled ${record.scheduledAt}`
+            );
         } catch (error) {
             lastError = error.message;
-            console.error("[BIG ODD] Publish error:", error.message);
+            console.error(`[BIG ODD] Publish error for ${item.id}:`, error.message);
         }
     }
 }
@@ -152,16 +172,13 @@ function tick() {
     const now = new Date();
 
     try {
-        if (shouldCreatePlan(now)) {
+        if (plannedDate !== dateKey(now)) {
+            createDailyPlan(now);
+        } else if (shouldCreatePlan(now)) {
             createDailyPlan(now);
         }
 
         publishDueItems(now);
-
-        // After midnight, the next tick creates the new day's plan.
-        if (plannedDate !== dateKey(now)) {
-            createDailyPlan(now);
-        }
     } catch (error) {
         lastError = error.message;
         console.error("[BIG ODD] Scheduler error:", error.message);
@@ -179,7 +196,7 @@ function install() {
     }
 
     console.log(
-        `[BIG ODD] Daily scheduler enabled. Count=${DAILY_COUNT}, publish=${PUBLISH_MINUTES}m before scheduled time, planHour=${PLAN_HOUR}:00 UTC.`
+        `[BIG ODD] Scheduler enabled. Count=${DAILY_COUNT}, publish=${PUBLISH_MINUTES}m before scheduled time, planHour=${PLAN_HOUR}:00 UTC.`
     );
 
     tick();
