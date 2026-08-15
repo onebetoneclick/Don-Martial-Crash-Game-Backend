@@ -18,29 +18,20 @@ The API key is supplied with:
 or:
   Authorization: Bearer YOUR_KEY
 
-The engine itself does not invent API results. The game
-server publishes generated BIG ODD records into it.
+API keys may be generated with:
+  POST /api/v1/api-key
 =========================================================
 */
 
 const engine = require("./big-odd-engine");
+const apiKeys = require("./api-key-manager");
 
 function getApiKey(req) {
-    const header = req.headers["x-api-key"];
-    if (header) return String(header).trim();
-
-    const authorization = req.headers.authorization || "";
-    if (/^Bearer\s+/i.test(authorization)) {
-        return authorization.replace(/^Bearer\s+/i, "").trim();
-    }
-
-    return "";
+    return apiKeys.getRequestKey(req);
 }
 
 function isAuthorized(req) {
-    const expected = String(process.env.BIG_ODD_API_KEY || "").trim();
-    if (!expected) return false;
-    return getApiKey(req) === expected;
+    return apiKeys.isValidApiKey(getApiKey(req));
 }
 
 function sendJson(res, statusCode, payload) {
