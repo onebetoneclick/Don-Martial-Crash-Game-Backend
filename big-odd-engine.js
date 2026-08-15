@@ -13,8 +13,8 @@ Lifecycle:
   RUNNING           -> status: running
   CRASHED           -> status: played
 
-The test publisher is intentionally separate from the real
-WebSocket bridge and is only for backend verification.
+The engine accepts the normal WebSocket round shape and the
+protected test publisher shape.
 =========================================================
 */
 
@@ -34,22 +34,48 @@ function makeId() {
 }
 
 function normalizeStatus(status) {
-    if (status === "played" || status === "CRASHED") return "played";
+    if (status === "played" || status === "PLAYED" || status === "CRASHED") return "played";
     if (status === "running" || status === "RUNNING") return "running";
     return null;
+}
+
+function getOddValue(round) {
+    if (!round || typeof round !== "object") return NaN;
+
+    const candidates = [
+        round.crashMultiplier,
+        round.odd,
+        round.multiplier,
+        round.bigOdd
+    ];
+
+    for (const value of candidates) {
+        if (value !== undefined && value !== null && String(value).trim() !== "") {
+            const number = Number(value);
+            if (Number.isFinite(number)) return number;
+        }
+    }
+
+    return NaN;
 }
 
 function publishFromRound(round) {
     if (!round) return null;
 
-    const multiplier = Number(round.crashMultiplier ?? round.odd);
-    if (!Number.isFinite(multiplier) || multiplier < BIG_ODD_MINIMUM) return null;
+    const multiplier = getOddValue(round);
 
-    const roundId = Number(round.roundId);
+    if (!Number.isFinite(multiplier) || multiplier < BIG_ODD_MINIMUM) {
+        return null;
+    }
+
+    const rawRoundId = round.roundId;
+    const roundId = Number(rawRoundId);
+
     const duplicate = records.find(item =>
         (Number.isFinite(roundId) && Number(item.roundId) === roundId) ||
         (round.bigOddId && item.id === round.bigOddId)
     );
+
     if (duplicate) return duplicate;
 
     const createdAt = round.createdAt || round.serverTime || new Date().toISOString();
@@ -68,18 +94,34 @@ function publishFromRound(round) {
     };
 
     records.unshift(record);
-    if (records.length > MAX_HISTORY) records.length = MAX_HISTORY;
+
+    if (records.length > MAX_HISTORY) {
+        records.length = MAX_HISTORY;
+    }
+
     return record;
 }
 
-function publishTestOdd({ odd, roundId, status = null } = {}) {
+function publishTestOdd(input = {}) {
+    const odd = input.odd ?? input.multiplier ?? input.bigOdd ?? input.crashMultiplier;
     const multiplier = Number(odd);
+
     if (!Number.isFinite(multiplier) || multiplier < BIG_ODD_MINIMUM) {
-        return { error: "INVALID_BIG_ODD", minimum: BIG_ODD_MINIMUM };
+        return {
+            error: "INVALID_BIG_ODD",
+            minimum: BIG_ODD_MINIMUM,
+            received: odd ?? null,
+            message: `Big Odd must be a number greater than or equal to ${BIG_ODD_MINIMUM}.`
+        };
     }
 
-    const id = Number.isFinite(Number(roundId)) ? Number(roundId) : `TEST-${Date.now()}`;
+    const numericRoundId = Number(input.roundId);
+    const id = Number.isFinite(numericRoundId)
+        ? numericRoundId
+        : `TEST-${Date.now()}`;
+
     const now = new Date().toISOString();
+    const status = normalizeStatus(input.status);
 
     return publishFromRound({
         roundId: id,
@@ -95,9 +137,11 @@ function publishTestOdd({ odd, roundId, status = null } = {}) {
 function updateRoundStatus(roundId, status, extra = {}) {
     const id = Number(roundId);
     const record = records.find(item => Number(item.roundId) === id);
+
     if (!record) return null;
 
     const normalized = normalizeStatus(status);
+
     if (normalized === "running") {
         record.status = "running";
         record.runningAt = extra.runningAt || record.runningAt || new Date().toISOString();
@@ -105,23 +149,37 @@ function updateRoundStatus(roundId, status, extra = {}) {
         record.status = "played";
         record.playedAt = extra.playedAt || record.playedAt || new Date().toISOString();
     }
+
     record.serverTime = new Date().toISOString();
     return record;
 }
 
-function getCurrent() { return records.find(item => item.status === "running") || null; }
-function getNext() { return getUpcoming()[0] || null; }
+function getCurrent() {
+    return records.find(item => item.status === "running") || null;
+}
+
+function getNext() {
+    return getUpcoming()[0] || null;
+}
+
 function getUpcoming() {
-    return records.filter(item => item.status === null)
+    return records
+        .filter(item => item.status === null)
         .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
 }
+
 function getToday() {
     const key = todayKey();
     return records.filter(item => item.date === key);
 }
-function getHistory() { return [...records]; }
+
+function getHistory() {
+    return [...records];
+}
+
 function getStats() {
     const today = getToday();
+
     return {
         total: records.length,
         today: today.length,
