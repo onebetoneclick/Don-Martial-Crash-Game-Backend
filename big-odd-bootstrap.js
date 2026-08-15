@@ -11,8 +11,25 @@ Big Odd REST API without replacing the current game server.
 It does three jobs:
 1. Adds /api/v1/big-odd/* routes to the existing HTTP server.
 2. Adds POST /api/v1/api-key for secure API-key generation.
-3. Watches server WebSocket messages so BIG ODD records are
-   automatically published/updated in the Big Odd Engine.
+3. Bridges WebSocket round events into the Big Odd Engine.
+
+BIG ODD FLOW:
+
+WebSocket generates round + crash odd
+        ↓
+ROUND_CREATED
+        ↓
+Big Odd Engine stores it as status: null
+        ↓
+REST /upcoming and /today can see it
+        ↓
+ROUND_STARTED
+        ↓
+status: running
+        ↓
+ROUND_CRASHED
+        ↓
+status: played
 =========================================================
 */
 
@@ -88,41 +105,64 @@ WebSocket.prototype.send = function patchedSend(data, ...args) {
             const message = JSON.parse(data);
             const payload = message && message.data;
 
-            if (payload && message.type === "ROUND_STARTED") {
+            if (payload && message.type === "ROUND_CREATED") {
                 const crashMultiplier = Number(payload.crashMultiplier);
 
                 if (
                     Number.isFinite(crashMultiplier) &&
                     crashMultiplier >= bigOddEngine.BIG_ODD_MINIMUM
                 ) {
-                    bigOddEngine.publishFromRound({
+                    const record = bigOddEngine.publishFromRound({
                         roundId: payload.roundId,
-                        status: "RUNNING",
+                        status: payload.status || "WAITING",
                         crashMultiplier,
-                        startedAt: payload.serverTime || new Date().toISOString(),
-                        createdAt: payload.serverTime || new Date().toISOString()
+                        createdAt: payload.createdAt || payload.serverTime,
+                        serverTime: payload.serverTime
                     });
 
-                    console.log(
-                        `[BIG ODD] Published round ${payload.roundId} at ${crashMultiplier.toFixed(2)}x`
-                    );
+                    if (record) {
+                        console.log(
+                            `[BIG ODD] Generated round ${payload.roundId} at ${crashMultiplier.toFixed(2)}x`
+                        );
+                    }
                 }
             }
 
-            if (payload && message.type === "ROUND_CRASHED") {
-                bigOddEngine.updateRoundStatus(
+            if (payload && message.type === "ROUND_STARTED") {
+                const record = bigOddEngine.updateRoundStatus(
                     payload.roundId,
-                    "CRASHED",
+                    "RUNNING",
                     {
-                        playedAt:
+                        runningAt:
                             payload.serverTime ||
                             new Date().toISOString()
                     }
                 );
 
-                console.log(
-                    `[BIG ODD] Round ${payload.roundId} marked played`
+                if (record) {
+                    console.log(
+                        `[BIG ODD] Round ${payload.roundId} is now running`
+                    );
+                }
+            }
+
+            if (payload && message.type === "ROUND_CRASHED") {
+                const record = bigOddEngine.updateRoundStatus(
+                    payload.roundId,
+                    "CRASHED",
+                    {
+                        playedAt:
+                            payload.crashedAt ||
+                            payload.serverTime ||
+                            new Date().toISOString()
+                    }
                 );
+
+                if (record) {
+                    console.log(
+                        `[BIG ODD] Round ${payload.roundId} marked played`
+                    );
+                }
             }
         }
     } catch {
