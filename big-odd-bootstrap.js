@@ -5,21 +5,9 @@
  DON MARTIAL BIG ODD BOOTSTRAP
 =========================================================
 
-Loads the Big Odd REST API, API-key manager, and the live
-WebSocket -> Big Odd bridge before server.js creates its
-HTTP/WebSocket server.
-
-FLOW:
-
-Crash WebSocket
-      ↓
-Big Odd WebSocket Bridge
-      ↓
-Big Odd Engine
-      ↓
-Big Odd REST API
-      ↓
-mt_live_ API key
+Loads the Big Odd REST API, API-key manager, live WebSocket
+bridge, and daily Big Odd scheduler before server.js creates
+its HTTP/WebSocket server.
 =========================================================
 */
 
@@ -28,10 +16,7 @@ const http = require("http");
 const bigOddApi = require("./big-odd-api");
 const apiKeyManager = require("./api-key-manager");
 const bigOddWebSocketBridge = require("./big-odd-websocket-bridge");
-
-/* =====================================================
-   HTTP ROUTE INTEGRATION
-===================================================== */
+const bigOddScheduler = require("./big-odd-scheduler");
 
 const originalCreateServer = http.createServer;
 
@@ -49,15 +34,9 @@ http.createServer = function patchedCreateServer(...args) {
                     `http://${req.headers.host || "localhost"}`
                 ).pathname;
             } catch {
-                // Keep the raw URL if parsing fails.
+                // Keep raw URL if parsing fails.
             }
 
-            /*
-             * Internal diagnostic endpoint.
-             * This confirms whether the bridge is connected to the
-             * crash WebSocket and whether it has received/published
-             * a Big Odd. It intentionally does not require an API key.
-             */
             if (pathname === "/api/v1/big-odd/bridge-status") {
                 res.writeHead(200, {
                     "Content-Type": "application/json",
@@ -69,6 +48,22 @@ http.createServer = function patchedCreateServer(...args) {
                     type: "bridge-status",
                     serverTime: new Date().toISOString(),
                     bridge: bigOddWebSocketBridge.getStatus()
+                }));
+
+                return;
+            }
+
+            if (pathname === "/api/v1/big-odd/scheduler-status") {
+                res.writeHead(200, {
+                    "Content-Type": "application/json",
+                    "Cache-Control": "no-store"
+                });
+
+                res.end(JSON.stringify({
+                    success: true,
+                    type: "scheduler-status",
+                    serverTime: new Date().toISOString(),
+                    scheduler: bigOddScheduler.getStatus()
                 }));
 
                 return;
@@ -104,10 +99,7 @@ http.createServer = function patchedCreateServer(...args) {
     return originalCreateServer.apply(http, args);
 };
 
-/* =====================================================
-   INSTALL LIVE WEBSOCKET BRIDGE
-===================================================== */
-
 bigOddWebSocketBridge.install();
+bigOddScheduler.install();
 
 console.log("[BIG ODD] Bootstrap loaded");
