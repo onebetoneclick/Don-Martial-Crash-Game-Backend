@@ -23,20 +23,12 @@ function normalizeStatus(status) {
 
 function readOdd(input) {
     if (!input || typeof input !== "object") return NaN;
-
-    const candidates = [
-        input.odd,
-        input.bigOdd,
-        input.multiplier,
-        input.crashMultiplier
-    ];
-
+    const candidates = [input.odd, input.bigOdd, input.multiplier, input.crashMultiplier];
     for (const candidate of candidates) {
         if (candidate === null || candidate === undefined || String(candidate).trim() === "") continue;
         const value = Number(String(candidate).trim().replace(/x$/i, ""));
         if (Number.isFinite(value)) return value;
     }
-
     return NaN;
 }
 
@@ -56,8 +48,9 @@ function publishFromRound(round) {
     );
 
     if (duplicate) {
-        const status = normalizeStatus(round.status);
+        if (hasRoundId && duplicate.roundId === null) duplicate.roundId = numericRoundId;
 
+        const status = normalizeStatus(round.status);
         if (status === "running") {
             duplicate.status = "running";
             duplicate.runningAt = round.startedAt || round.serverTime || duplicate.runningAt;
@@ -78,8 +71,11 @@ function publishFromRound(round) {
         roundId: hasRoundId ? numericRoundId : null,
         odd: Number(multiplier.toFixed(2)),
         status,
-        date: todayKey(createdAt),
+        date: todayKey(round.date || round.scheduledAt || createdAt),
         createdAt,
+        scheduledAt: round.scheduledAt || null,
+        publishAt: round.publishAt || null,
+        publishedAt: round.publishedAt || new Date().toISOString(),
         runningAt: status === "running" ? (round.startedAt || round.serverTime || null) : null,
         playedAt: status === "played" ? (round.crashedAt || round.serverTime || null) : null,
         serverTime: new Date().toISOString()
@@ -92,7 +88,6 @@ function publishFromRound(round) {
 
 function publishTestOdd(input = {}) {
     const multiplier = readOdd(input);
-
     if (!Number.isFinite(multiplier) || multiplier < BIG_ODD_MINIMUM) {
         return {
             error: "INVALID_BIG_ODD",
@@ -124,7 +119,6 @@ function updateRoundStatus(roundId, status, extra = {}) {
     if (!record) return null;
 
     const normalized = normalizeStatus(status);
-
     if (normalized === "running") {
         record.status = "running";
         record.runningAt = extra.runningAt || record.runningAt || new Date().toISOString();
@@ -133,6 +127,35 @@ function updateRoundStatus(roundId, status, extra = {}) {
         record.playedAt = extra.playedAt || record.playedAt || new Date().toISOString();
     }
 
+    record.serverTime = new Date().toISOString();
+    return record;
+}
+
+function bindScheduledToRound(roundId, scheduledAt = new Date()) {
+    const id = Number(roundId);
+    if (!Number.isFinite(id)) return null;
+
+    const target = new Date(scheduledAt).getTime();
+    if (!Number.isFinite(target)) return null;
+
+    const windowMs = Number(process.env.BIG_ODD_BIND_WINDOW_MINUTES || 5) * 60 * 1000;
+
+    const candidates = records
+        .filter(item =>
+            item.status === null &&
+            item.roundId === null &&
+            item.scheduledAt &&
+            Math.abs(new Date(item.scheduledAt).getTime() - target) <= windowMs
+        )
+        .sort((a, b) =>
+            Math.abs(new Date(a.scheduledAt).getTime() - target) -
+            Math.abs(new Date(b.scheduledAt).getTime() - target)
+        );
+
+    const record = candidates[0];
+    if (!record) return null;
+
+    record.roundId = id;
     record.serverTime = new Date().toISOString();
     return record;
 }
@@ -148,7 +171,12 @@ function getNext() {
 function getUpcoming() {
     return records
         .filter(item => item.status === null)
-        .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+        .sort((a, b) => {
+            const at = new Date(a.scheduledAt || a.createdAt).getTime();
+            const bt = new Date(b.scheduledAt || b.createdAt).getTime();
+            return (Number.isFinite(at) ? at : Number.MAX_SAFE_INTEGER) -
+                (Number.isFinite(bt) ? bt : Number.MAX_SAFE_INTEGER);
+        });
 }
 
 function getToday() {
@@ -175,6 +203,7 @@ module.exports = {
     BIG_ODD_MINIMUM,
     publishFromRound,
     publishTestOdd,
+    bindScheduledToRound,
     updateRoundStatus,
     getCurrent,
     getNext,
