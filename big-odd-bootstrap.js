@@ -8,13 +8,11 @@
 This file connects the existing crash-game server to the
 Big Odd REST API without replacing the current game server.
 
-It does two jobs:
+It does three jobs:
 1. Adds /api/v1/big-odd/* routes to the existing HTTP server.
-2. Watches server WebSocket messages so BIG ODD records are
+2. Adds POST /api/v1/api-key for secure API-key generation.
+3. Watches server WebSocket messages so BIG ODD records are
    automatically published/updated in the Big Odd Engine.
-
-Start with:
-  node -r ./big-odd-bootstrap.js server.js
 =========================================================
 */
 
@@ -23,6 +21,7 @@ const WebSocket = require("ws");
 
 const bigOddApi = require("./big-odd-api");
 const bigOddEngine = require("./big-odd-engine");
+const apiKeyManager = require("./api-key-manager");
 
 /* =====================================================
    HTTP ROUTE INTEGRATION
@@ -45,6 +44,19 @@ http.createServer = function patchedCreateServer(...args) {
                 ).pathname;
             } catch {
                 // Keep the raw URL if parsing fails.
+            }
+
+            if (
+                pathname === "/api/v1/api-key" ||
+                pathname === "/api/v1/api-key/generate"
+            ) {
+                const handled = apiKeyManager.handleApiKeyRequest(
+                    req,
+                    res,
+                    pathname
+                );
+
+                if (handled) return;
             }
 
             if (pathname.startsWith("/api/v1/big-odd/")) {
