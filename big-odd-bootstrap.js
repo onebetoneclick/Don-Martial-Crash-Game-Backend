@@ -52,6 +52,28 @@ http.createServer = function patchedCreateServer(...args) {
                 // Keep the raw URL if parsing fails.
             }
 
+            /*
+             * Internal diagnostic endpoint.
+             * This confirms whether the bridge is connected to the
+             * crash WebSocket and whether it has received/published
+             * a Big Odd. It intentionally does not require an API key.
+             */
+            if (pathname === "/api/v1/big-odd/bridge-status") {
+                res.writeHead(200, {
+                    "Content-Type": "application/json",
+                    "Cache-Control": "no-store"
+                });
+
+                res.end(JSON.stringify({
+                    success: true,
+                    type: "bridge-status",
+                    serverTime: new Date().toISOString(),
+                    bridge: bigOddWebSocketBridge.getStatus()
+                }));
+
+                return;
+            }
+
             if (
                 pathname === "/api/v1/api-key" ||
                 pathname === "/api/v1/api-key/generate"
