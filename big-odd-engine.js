@@ -32,20 +32,31 @@ function readOdd(input) {
     return NaN;
 }
 
+function getNumericRoundId(value) {
+    if (value === null || value === undefined || String(value).trim() === "") return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+}
+
 function publishFromRound(round) {
     if (!round || typeof round !== "object") return null;
 
     const multiplier = readOdd(round);
     if (!Number.isFinite(multiplier) || multiplier < BIG_ODD_MINIMUM) return null;
 
-    const numericRoundId = Number(round.roundId);
-    const hasRoundId = Number.isFinite(numericRoundId);
+    // IMPORTANT: Number(null) is 0 in JavaScript. Never treat a missing
+    // roundId as round 0, otherwise every scheduled Big Odd collides with
+    // the first scheduled record.
+    const numericRoundId = getNumericRoundId(round.roundId);
+    const hasRoundId = numericRoundId !== null;
     const suppliedId = String(round.bigOddId || "").trim();
 
-    const duplicate = records.find(item =>
-        (hasRoundId && Number(item.roundId) === numericRoundId) ||
-        (suppliedId && item.id === suppliedId)
-    );
+    const duplicate = records.find(item => {
+        const itemRoundId = getNumericRoundId(item.roundId);
+        const sameRound = hasRoundId && itemRoundId !== null && itemRoundId === numericRoundId;
+        const sameBigOdd = suppliedId && item.id === suppliedId;
+        return sameRound || sameBigOdd;
+    });
 
     if (duplicate) {
         if (hasRoundId && duplicate.roundId === null) duplicate.roundId = numericRoundId;
@@ -97,8 +108,8 @@ function publishTestOdd(input = {}) {
         };
     }
 
-    const numericRoundId = Number(input.roundId);
-    const roundId = Number.isFinite(numericRoundId) ? numericRoundId : `TEST-${Date.now()}`;
+    const numericRoundId = getNumericRoundId(input.roundId);
+    const roundId = numericRoundId !== null ? numericRoundId : `TEST-${Date.now()}`;
     const now = new Date().toISOString();
     const status = normalizeStatus(input.status);
 
@@ -114,8 +125,13 @@ function publishTestOdd(input = {}) {
 }
 
 function updateRoundStatus(roundId, status, extra = {}) {
-    const id = Number(roundId);
-    const record = records.find(item => Number(item.roundId) === id);
+    const id = getNumericRoundId(roundId);
+    if (id === null) return null;
+
+    const record = records.find(item => {
+        const itemId = getNumericRoundId(item.roundId);
+        return itemId !== null && itemId === id;
+    });
     if (!record) return null;
 
     const normalized = normalizeStatus(status);
@@ -132,8 +148,8 @@ function updateRoundStatus(roundId, status, extra = {}) {
 }
 
 function bindScheduledToRound(roundId, scheduledAt = new Date()) {
-    const id = Number(roundId);
-    if (!Number.isFinite(id)) return null;
+    const id = getNumericRoundId(roundId);
+    if (id === null) return null;
 
     const target = new Date(scheduledAt).getTime();
     if (!Number.isFinite(target)) return null;
