@@ -22,7 +22,8 @@ function getConfig() {
         publicKey,
         secretKey,
         environment,
-        url: environment === "production" ? OPAY_PRODUCTION_URL : OPAY_SANDBOX_URL
+        url: environment === "production" ? OPAY_PRODUCTION_URL : OPAY_SANDBOX_URL,
+        callbackUrl: process.env.OPAY_CALLBACK_URL || "https://don-martial-crash-game-backend.onrender.com/api/v1/payments/opay/webhook"
     };
 }
 
@@ -47,6 +48,8 @@ async function createCashierPayment({ amount, currency = "NGN", productName = "D
     }
 
     const reference = createReference();
+    const finalCallbackUrl = callbackUrl || config.callbackUrl;
+
     const body = {
         country: "NG",
         reference,
@@ -58,6 +61,15 @@ async function createCashierPayment({ amount, currency = "NGN", productName = "D
             name: productName,
             description: productDescription
         },
+        productList: [
+            {
+                productId: reference,
+                name: productName,
+                description: productDescription,
+                price: numericAmount,
+                quantity: 1
+            }
+        ],
         userInfo: {
             userId: String(user.id || reference),
             userName: String(user.name || "Don Martial Customer"),
@@ -65,8 +77,9 @@ async function createCashierPayment({ amount, currency = "NGN", productName = "D
             userMobile: String(user.mobile || "")
         },
         returnUrl,
-        callbackUrl: callbackUrl || undefined,
-        cancelUrl: cancelUrl || undefined
+        callbackUrl: finalCallbackUrl,
+        cancelUrl: cancelUrl || undefined,
+        expireAt: 30
     };
 
     const response = await fetch(config.url, {
@@ -99,6 +112,7 @@ async function createCashierPayment({ amount, currency = "NGN", productName = "D
     return {
         reference,
         environment: config.environment,
+        callbackUrl: finalCallbackUrl,
         opay: data
     };
 }
