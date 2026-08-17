@@ -2,13 +2,18 @@
 
 const engine = require("./big-odd-engine");
 const apiKeys = require("./api-key-manager");
+const planManager = require("./api-plan-manager");
 
 function getApiKey(req) {
     return apiKeys.getRequestKey(req);
 }
 
+function getKeyRecord(req) {
+    return apiKeys.getRequestKeyRecord(req);
+}
+
 function isAuthorized(req) {
-    return apiKeys.isValidApiKey(getApiKey(req));
+    return Boolean(getKeyRecord(req));
 }
 
 function isAdmin(req) {
@@ -69,22 +74,15 @@ function handleBigOddRequest(req, res, pathname) {
             try {
                 input = body ? JSON.parse(body) : {};
             } catch {
-                sendJson(res, 400, {
-                    success: false,
-                    error: "INVALID_JSON"
-                });
+                sendJson(res, 400, { success: false, error: "INVALID_JSON" });
                 return;
             }
 
             if (!input || typeof input !== "object" || Array.isArray(input)) {
-                sendJson(res, 400, {
-                    success: false,
-                    error: "INVALID_REQUEST_BODY"
-                });
+                sendJson(res, 400, { success: false, error: "INVALID_REQUEST_BODY" });
                 return;
             }
 
-            // Accept all names used by the WebSocket/game server.
             const odd =
                 input.odd ??
                 input.bigOdd ??
@@ -128,7 +126,9 @@ function handleBigOddRequest(req, res, pathname) {
         return true;
     }
 
-    if (!isAuthorized(req)) {
+    const keyRecord = getKeyRecord(req);
+
+    if (!keyRecord) {
         sendJson(res, 401, {
             success: false,
             error: "INVALID_API_KEY",
@@ -136,6 +136,8 @@ function handleBigOddRequest(req, res, pathname) {
         });
         return true;
     }
+
+    const plan = planManager.getPlan(keyRecord.plan);
 
     let data;
     let type;
@@ -145,22 +147,44 @@ function handleBigOddRequest(req, res, pathname) {
             type = "current";
             data = engine.getCurrent();
             break;
+
         case "/api/v1/big-odd/next":
             type = "next";
             data = engine.getNext();
             break;
+
         case "/api/v1/big-odd/upcoming":
+            if (!plan.upcomingBigOdd) {
+                sendJson(res, 403, {
+                    success: false,
+                    error: "PLAN_UPGRADE_REQUIRED",
+                    message: "Upcoming Big Odd is available from the Premium plan.",
+                    plan: plan.id,
+                    requiredPlan: "premium",
+                    upgrade: true,
+                    availableEndpoints: {
+                        current: "/api/v1/big-odd/current",
+                        history: "/api/v1/big-odd/history",
+                        today: "/api/v1/big-odd/today"
+                    }
+                });
+                return true;
+            }
+
             type = "upcoming";
-            data = engine.getUpcoming();
+            data = engine.getUpcoming().slice(0, plan.upcomingLimit);
             break;
+
         case "/api/v1/big-odd/today":
             type = "today";
             data = engine.getToday();
             break;
+
         case "/api/v1/big-odd/history":
             type = "history";
             data = engine.getHistory();
             break;
+
         default:
             sendJson(res, 404, {
                 success: false,
@@ -172,6 +196,7 @@ function handleBigOddRequest(req, res, pathname) {
     sendJson(res, 200, {
         success: true,
         type,
+        plan: planManager.getPlanResponse(plan.id),
         serverTime: new Date().toISOString(),
         data,
         stats: engine.getStats()
