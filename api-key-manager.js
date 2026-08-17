@@ -1,26 +1,30 @@
 "use strict";
 
+const crypto = require("crypto");
+const planManager = require("./api-plan-manager");
+
 /*
 =========================================================
- DON MARTIAL BIG ODD API KEY MANAGER
+ DON MARTIAL API KEY MANAGER
 =========================================================
 
-API keys use this format:
-  mt_live_<32 hex characters>
+Every generated key has a plan and its permissions are
+checked on the backend. Plaintext keys are never stored.
 
-Generated keys are stored as SHA-256 hashes in memory.
-The plaintext key is returned only when it is created.
+Plans:
+  starter    -> no upcoming Big Odd
+  premium    -> 3 upcoming Big Odds
+  enterprise -> 5 upcoming Big Odds
+  ultimate   -> 10 upcoming Big Odds
 
-For production, set:
-  BIG_ODD_ADMIN_KEY
-
-The admin key is required to create new subscriber keys.
+IMPORTANT:
+This in-memory registry is the first API-key layer. The
+subscription/database layer can later persist these records
+without changing the API contract.
 =========================================================
 */
 
-const crypto = require("crypto");
-
-const generatedKeyHashes = new Set();
+const generatedKeys = new Map();
 
 function hashKey(key) {
     return crypto
@@ -29,24 +33,49 @@ function hashKey(key) {
         .digest("hex");
 }
 
-function generateApiKey() {
-    const key = `mt_live_${crypto.randomBytes(16).toString("hex")}`;
-    generatedKeyHashes.add(hashKey(key));
+function generateApiKey(options = {}) {
+    const plan = planManager.normalizePlan(options.plan);
+    const key = `mt_live_${crypto.randomBytes(24).toString("hex")}`;
+    const keyHash = hashKey(key);
+    const now = new Date().toISOString();
+
+    generatedKeys.set(keyHash, {
+        keyId: `key_${crypto.randomBytes(8).toString("hex")}`,
+        plan,
+        status: "active",
+        createdAt: now,
+        lastUsedAt: null
+    });
+
     return key;
 }
 
-function isValidApiKey(key) {
+function getKeyRecord(key) {
     const supplied = String(key || "").trim();
+    if (!supplied) return null;
 
-    if (!supplied) return false;
+    const record = generatedKeys.get(hashKey(supplied));
+    if (!record || record.status !== "active") return null;
 
-    const configured = String(process.env.BIG_ODD_API_KEY || "").trim();
+    record.lastUsedAt = new Date().toISOString();
+    return record;
+}
 
-    if (configured && supplied === configured) {
-        return true;
-    }
+function getApiKeyInfo(key) {
+    const record = getKeyRecord(key);
+    if (!record) return null;
 
-    return generatedKeyHashes.has(hashKey(supplied));
+    return {
+        keyId: record.keyId,
+        plan: planManager.getPlanResponse(record.plan),
+        status: record.status,
+        createdAt: record.createdAt,
+        lastUsedAt: record.lastUsedAt
+    };
+}
+
+function isValidApiKey(key) {
+    return Boolean(getKeyRecord(key));
 }
 
 function getRequestKey(req) {
@@ -61,6 +90,10 @@ function getRequestKey(req) {
     return "";
 }
 
+function getRequestKeyRecord(req) {
+    return getKeyRecord(getRequestKey(req));
+}
+
 function sendJson(res, statusCode, payload) {
     res.writeHead(statusCode, {
         "Content-Type": "application/json; charset=utf-8",
@@ -71,50 +104,81 @@ function sendJson(res, statusCode, payload) {
     res.end(JSON.stringify(payload));
 }
 
+function isAdmin(req) {
+    const configuredAdminKey = String(
+        process.env.BIG_ODD_ADMIN_KEY || ""
+    ).trim();
+
+    const suppliedAdminKey = String(
+        req.headers["x-admin-key"] || ""
+    ).trim();
+
+    return Boolean(configuredAdminKey && suppliedAdminKey && suppliedAdminKey === configuredAdminKey);
+}
+
 function handleApiKeyRequest(req, res, pathname) {
-    if (
-        pathname !== "/api/v1/api-key" &&
-        pathname !== "/api/v1/api-key/generate"
-    ) {
-        return false;
-    }
+    const isKeyRoute =
+        pathname === "/api/v1/api-key" ||
+        pathname === "/api/v1/api-key/generate" ||
+        pathname === "/api/v1/api-key/plans" ||
+        pathname === "/api/v1/api-key/me";
+
+    if (!isKeyRoute) return false;
 
     if (req.method === "OPTIONS") {
         res.writeHead(204, {
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
             "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key, X-Admin-Key"
         });
         res.end();
         return true;
     }
 
+    if (pathname === "/api/v1/api-key/plans") {
+        if (req.method !== "GET") {
+            sendJson(res, 405, { success: false, error: "METHOD_NOT_ALLOWED" });
+            return true;
+        }
+
+        sendJson(res, 200, {
+            success: true,
+            plans: planManager.listPlans().map(plan => planManager.getPlanResponse(plan.id))
+        });
+        return true;
+    }
+
+    if (pathname === "/api/v1/api-key/me") {
+        if (req.method !== "GET") {
+            sendJson(res, 405, { success: false, error: "METHOD_NOT_ALLOWED" });
+            return true;
+        }
+
+        const key = getRequestKey(req);
+        const info = getApiKeyInfo(key);
+
+        if (!info) {
+            sendJson(res, 401, {
+                success: false,
+                error: "INVALID_API_KEY",
+                message: "A valid API key is required."
+            });
+            return true;
+        }
+
+        sendJson(res, 200, {
+            success: true,
+            data: info
+        });
+        return true;
+    }
+
     if (req.method !== "POST") {
-        sendJson(res, 405, {
-            success: false,
-            error: "METHOD_NOT_ALLOWED"
-        });
+        sendJson(res, 405, { success: false, error: "METHOD_NOT_ALLOWED" });
         return true;
     }
 
-    const configuredAdminKey = String(
-        process.env.BIG_ODD_ADMIN_KEY || ""
-    ).trim();
-
-    if (!configuredAdminKey) {
-        sendJson(res, 503, {
-            success: false,
-            error: "API_KEY_PROVISIONING_NOT_CONFIGURED",
-            message: "Set BIG_ODD_ADMIN_KEY in Render environment variables before creating API keys."
-        });
-        return true;
-    }
-
-    const suppliedAdminKey = String(
-        req.headers["x-admin-key"] || ""
-    ).trim();
-
-    if (!suppliedAdminKey || suppliedAdminKey !== configuredAdminKey) {
+    if (!isAdmin(req)) {
         sendJson(res, 401, {
             success: false,
             error: "INVALID_ADMIN_KEY",
@@ -123,14 +187,41 @@ function handleApiKeyRequest(req, res, pathname) {
         return true;
     }
 
-    const apiKey = generateApiKey();
+    let body = "";
 
-    sendJson(res, 201, {
-        success: true,
-        message: "Big Odd API key created. Store this key securely; it will not be returned again.",
-        apiKey,
-        prefix: "mt_live_",
-        createdAt: new Date().toISOString()
+    req.on("data", chunk => {
+        body += chunk.toString();
+        if (body.length > 10000) req.destroy();
+    });
+
+    req.on("end", () => {
+        let input = {};
+
+        try {
+            input = body ? JSON.parse(body) : {};
+        } catch {
+            sendJson(res, 400, { success: false, error: "INVALID_JSON" });
+            return;
+        }
+
+        const plan = planManager.normalizePlan(input.plan);
+        const apiKey = generateApiKey({ plan });
+
+        sendJson(res, 201, {
+            success: true,
+            message: "API key created. Store this key securely; the plaintext key will not be returned again.",
+            apiKey,
+            plan: planManager.getPlanResponse(plan),
+            endpoints: {
+                current: "/api/v1/big-odd/current",
+                history: "/api/v1/big-odd/history",
+                today: "/api/v1/big-odd/today",
+                upcoming: planManager.getPlan(plan).upcomingBigOdd
+                    ? "/api/v1/big-odd/upcoming"
+                    : null
+            },
+            createdAt: new Date().toISOString()
+        });
     });
 
     return true;
@@ -140,5 +231,7 @@ module.exports = {
     generateApiKey,
     isValidApiKey,
     getRequestKey,
+    getRequestKeyRecord,
+    getApiKeyInfo,
     handleApiKeyRequest
 };
