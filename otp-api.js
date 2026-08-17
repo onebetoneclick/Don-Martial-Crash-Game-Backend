@@ -7,31 +7,43 @@ const nodemailer = require("nodemailer");
 
 const DATA_DIR = path.join(__dirname, "data");
 const OTP_FILE = path.join(DATA_DIR, "otps.json");
+const VERIFIED_FILE = path.join(DATA_DIR, "verified-emails.json");
+
 const OTP_TTL_MS = 10 * 60 * 1000;
 const RESEND_COOLDOWN_MS = 60 * 1000;
 const MAX_ATTEMPTS = 5;
+const SMTP_CONNECTION_TIMEOUT = Number(process.env.SMTP_CONNECTION_TIMEOUT || 10000);
+const SMTP_GREETING_TIMEOUT = Number(process.env.SMTP_GREETING_TIMEOUT || 10000);
+const SMTP_SOCKET_TIMEOUT = Number(process.env.SMTP_SOCKET_TIMEOUT || 15000);
+const SMTP_SEND_TIMEOUT = Number(process.env.SMTP_SEND_TIMEOUT || 20000);
 
 function ensureStorage() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(OTP_FILE)) fs.writeFileSync(OTP_FILE, "[]");
+  if (!fs.existsSync(VERIFIED_FILE)) fs.writeFileSync(VERIFIED_FILE, "[]");
 }
 
-function readOtps() {
+function readJson(file) {
   ensureStorage();
   try {
-    const value = JSON.parse(fs.readFileSync(OTP_FILE, "utf8"));
+    const value = JSON.parse(fs.readFileSync(file, "utf8"));
     return Array.isArray(value) ? value : [];
   } catch {
     return [];
   }
 }
 
-function writeOtps(value) {
+function writeJson(file, value) {
   ensureStorage();
-  const tmp = OTP_FILE + ".tmp";
+  const tmp = file + ".tmp";
   fs.writeFileSync(tmp, JSON.stringify(value, null, 2));
-  fs.renameSync(tmp, OTP_FILE);
+  fs.renameSync(tmp, file);
 }
+
+function readOtps() { return readJson(OTP_FILE); }
+function writeOtps(value) { writeJson(OTP_FILE, value); }
+function readVerified() { return readJson(VERIFIED_FILE); }
+function writeVerified(value) { writeJson(VERIFIED_FILE, value); }
 
 function normalizeEmail(value) {
   return String(value || "").trim().toLowerCase();
@@ -46,18 +58,22 @@ function hashOtp(otp, salt) {
 }
 
 function createTransporter() {
-  const host = process.env.SMTP_HOST;
+  const host = String(process.env.SMTP_HOST || "").trim();
   const port = Number(process.env.SMTP_PORT || 587);
-  const user = process.env.SMTP_USER;
-  const pass = process.env.SMTP_PASS;
+  const user = String(process.env.SMTP_USER || "").trim();
+  const pass = String(process.env.SMTP_PASS || "");
 
-  if (!host || !user || !pass) return null;
+  if (!host || !Number.isFinite(port) || !user || !pass) return null;
 
   return nodemailer.createTransport({
     host,
     port,
     secure: port === 465,
-    auth: { user, pass }
+    auth: { user, pass },
+    connectionTimeout: SMTP_CONNECTION_TIMEOUT,
+    greetingTimeout: SMTP_GREETING_TIMEOUT,
+    socketTimeout: SMTP_SOCKET_TIMEOUT,
+    logger: false
   });
 }
 
@@ -73,22 +89,77 @@ function sendJson(res, status, payload) {
 function parseBody(req) {
   return new Promise((resolve, reject) => {
     let raw = "";
+    let settled = false;
+
+    const fail = error => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+
+    req.setTimeout(10000, () => fail(new Error("Request body timeout")));
+
     req.on("data", chunk => {
       raw += chunk.toString();
       if (raw.length > 1024 * 1024) {
-        req.destroy();
-        reject(new Error("Request body too large"));
+        fail(new Error("Request body too large"));
+        try { req.destroy(); } catch {}
       }
     });
+
     req.on("end", () => {
+      if (settled) return;
       try {
+        settled = true;
         resolve(raw ? JSON.parse(raw) : {});
       } catch {
-        reject(new Error("Invalid JSON body"));
+        fail(new Error("Invalid JSON body"));
       }
     });
-    req.on("error", reject);
+
+    req.on("error", fail);
+    req.on("aborted", () => fail(new Error("Request aborted")));
   });
+}
+
+function markEmailVerified(email, purpose) {
+  const now = Date.now();
+  const records = readVerified().filter(item => new Date(item.expiresAt).getTime() > now);
+  records.push({
+    id: "verified_" + crypto.randomBytes(10).toString("hex"),
+    email,
+    purpose,
+    verifiedAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + 15 * 60 * 1000).toISOString()
+  });
+  writeVerified(records.slice(-5000));
+}
+
+function consumeVerifiedEmail(email, purpose) {
+  const now = Date.now();
+  const records = readVerified().filter(item => new Date(item.expiresAt).getTime() > now);
+  const index = records.findIndex(item => item.email === email && item.purpose === purpose);
+  if (index === -1) {
+    writeVerified(records);
+    return false;
+  }
+  records.splice(index, 1);
+  writeVerified(records);
+  return true;
+}
+
+function isEmailVerified(email, purpose) {
+  const now = Date.now();
+  const records = readVerified().filter(item => new Date(item.expiresAt).getTime() > now);
+  writeVerified(records);
+  return records.some(item => item.email === email && item.purpose === purpose);
+}
+
+async function sendMailWithTimeout(transporter, mail) {
+  return Promise.race([
+    transporter.sendMail(mail),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("SMTP send timeout")), SMTP_SEND_TIMEOUT))
+  ]);
 }
 
 async function sendOtp(req, res) {
@@ -130,7 +201,8 @@ async function sendOtp(req, res) {
     return sendJson(res, 503, {
       success: false,
       error: "SMTP_NOT_CONFIGURED",
-      message: "OTP email service is not configured on the server yet. Add SMTP_HOST, SMTP_PORT, SMTP_USER and SMTP_PASS to Render environment variables."
+      message: "OTP email service is not configured on the server.",
+      requiredEnvironment: ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS"]
     });
   }
 
@@ -155,7 +227,7 @@ async function sendOtp(req, res) {
   const appName = process.env.APP_NAME || "Don Martial";
 
   try {
-    await transporter.sendMail({
+    await sendMailWithTimeout(transporter, {
       from: `${appName} <${from}>`,
       to: email,
       subject: `${appName} verification code`,
@@ -166,7 +238,14 @@ async function sendOtp(req, res) {
     records = readOtps().filter(item => item.id !== record.id);
     writeOtps(records);
     console.error("[OTP EMAIL]", error.message);
-    return sendJson(res, 502, { success: false, error: "OTP_SEND_FAILED", message: "The verification email could not be sent." });
+    return sendJson(res, 502, {
+      success: false,
+      error: "OTP_SEND_FAILED",
+      message: "The verification email could not be sent.",
+      details: process.env.NODE_ENV === "production" ? undefined : error.message
+    });
+  } finally {
+    try { transporter.close(); } catch {}
   }
 
   return sendJson(res, 200, {
@@ -195,6 +274,10 @@ async function verifyOtp(req, res) {
     return sendJson(res, 400, { success: false, error: "INVALID_OTP", message: "Enter the email and the 6-digit OTP." });
   }
 
+  if (!["signup", "login", "password_reset"].includes(purpose)) {
+    return sendJson(res, 400, { success: false, error: "INVALID_PURPOSE", message: "Invalid OTP purpose." });
+  }
+
   const now = Date.now();
   const records = readOtps().filter(item => new Date(item.expiresAt).getTime() > now);
   const record = records.find(item => item.email === email && item.purpose === purpose);
@@ -221,12 +304,15 @@ async function verifyOtp(req, res) {
   }
 
   writeOtps(records.filter(item => item.id !== record.id));
+  markEmailVerified(email, purpose);
+
   return sendJson(res, 200, {
     success: true,
     verified: true,
     message: "OTP verified successfully.",
     email,
-    purpose
+    purpose,
+    verificationExpiresInSeconds: 15 * 60
   });
 }
 
@@ -248,4 +334,8 @@ function handleOtpRequest(req, res, pathname) {
 }
 
 ensureStorage();
-module.exports = { handleOtpRequest };
+module.exports = {
+  handleOtpRequest,
+  isEmailVerified,
+  consumeVerifiedEmail
+};
