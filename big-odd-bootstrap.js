@@ -37,6 +37,46 @@ function sendJson(res, statusCode, payload) {
     res.end(JSON.stringify(payload));
 }
 
+function getRequestKeyRecord(req) {
+    return apiKeyManager.getRequestKeyRecord(req);
+}
+
+function getPlanUpgradeResponse(res, plan) {
+    sendJson(res, 403, {
+        success: false,
+        error: "PLAN_UPGRADE_REQUIRED",
+        message: "Scheduler status is available from the Premium plan.",
+        plan: plan.id,
+        requiredPlan: "premium",
+        upgrade: true,
+        availableEndpoints: {
+            current: "/api/v1/big-odd/current",
+            history: "/api/v1/big-odd/history",
+            today: "/api/v1/big-odd/today"
+        }
+    });
+}
+
+function getCustomerSchedulerStatus(plan) {
+    const scheduler = bigOddScheduler.getStatus();
+    const nowMs = Date.now();
+    const limit = Math.max(1, Number(plan.upcomingLimit || 0));
+
+    const upcoming = scheduler.plan
+        .filter(item => {
+            const scheduledMs = new Date(item.scheduledAt).getTime();
+            return !item.published && Number.isFinite(scheduledMs) && scheduledMs > nowMs;
+        })
+        .sort((a, b) => new Date(a.scheduledAt) - new Date(b.scheduledAt))
+        .slice(0, limit);
+
+    return {
+        ...scheduler,
+        plan: upcoming,
+        dailyCount: upcoming.length
+    };
+}
+
 http.createServer = function patchedCreateServer(...args) {
     const listenerIndex = typeof args[0] === "function" ? 0 : 1;
     const originalListener = args[listenerIndex];
@@ -93,12 +133,40 @@ http.createServer = function patchedCreateServer(...args) {
                 return;
             }
 
+            /* Customer scheduler-status: Premium+ only, plan-filtered. */
             if (pathname === "/api/v1/big-odd/scheduler-status") {
+                if (req.method !== "GET") {
+                    sendJson(res, 405, {
+                        success: false,
+                        error: "METHOD_NOT_ALLOWED"
+                    });
+                    return;
+                }
+
+                const keyRecord = getRequestKeyRecord(req);
+
+                if (!keyRecord) {
+                    sendJson(res, 401, {
+                        success: false,
+                        error: "INVALID_API_KEY",
+                        message: "A valid Big Odd API key is required."
+                    });
+                    return;
+                }
+
+                const plan = planManager.getPlan(keyRecord.plan);
+
+                if (!plan.upcomingBigOdd) {
+                    getPlanUpgradeResponse(res, plan);
+                    return;
+                }
+
                 sendJson(res, 200, {
                     success: true,
                     type: "scheduler-status",
+                    plan: planManager.getPlanResponse(plan.id),
                     serverTime: new Date().toISOString(),
-                    scheduler: bigOddScheduler.getStatus()
+                    scheduler: getCustomerSchedulerStatus(plan)
                 });
                 return;
             }
