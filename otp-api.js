@@ -12,10 +12,13 @@ const VERIFIED_FILE = path.join(DATA_DIR, "verified-emails.json");
 const OTP_TTL_MS = 10 * 60 * 1000;
 const RESEND_COOLDOWN_MS = 60 * 1000;
 const MAX_ATTEMPTS = 5;
-const SMTP_CONNECTION_TIMEOUT = Number(process.env.SMTP_CONNECTION_TIMEOUT || 10000);
-const SMTP_GREETING_TIMEOUT = Number(process.env.SMTP_GREETING_TIMEOUT || 10000);
-const SMTP_SOCKET_TIMEOUT = Number(process.env.SMTP_SOCKET_TIMEOUT || 15000);
-const SMTP_SEND_TIMEOUT = Number(process.env.SMTP_SEND_TIMEOUT || 20000);
+
+// Keep SMTP operations short so an unavailable mail server never leaves
+// the HTTP request hanging until Render's proxy returns a 502.
+const SMTP_CONNECTION_TIMEOUT = 5000;
+const SMTP_GREETING_TIMEOUT = 5000;
+const SMTP_SOCKET_TIMEOUT = 7000;
+const SMTP_SEND_TIMEOUT = 9000;
 
 function ensureStorage() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -58,17 +61,15 @@ function hashOtp(otp, salt) {
 }
 
 function createTransporter() {
-  const host = String(process.env.SMTP_HOST || "").trim();
-  const port = Number(process.env.SMTP_PORT || 587);
   const user = String(process.env.SMTP_USER || "").trim();
   const pass = String(process.env.SMTP_PASS || "");
 
-  if (!host || !Number.isFinite(port) || !user || !pass) return null;
+  if (!user || !pass) return null;
 
+  // Gmail-specific transporter. Nodemailer handles smtp.gmail.com,
+  // port 465 and TLS configuration for us.
   return nodemailer.createTransport({
-    host,
-    port,
-    secure: port === 465,
+    service: "gmail",
     auth: { user, pass },
     connectionTimeout: SMTP_CONNECTION_TIMEOUT,
     greetingTimeout: SMTP_GREETING_TIMEOUT,
@@ -97,7 +98,7 @@ function parseBody(req) {
       reject(error);
     };
 
-    req.setTimeout(10000, () => fail(new Error("Request body timeout")));
+    req.setTimeout(5000, () => fail(new Error("Request body timeout")));
 
     req.on("data", chunk => {
       raw += chunk.toString();
@@ -156,10 +157,17 @@ function isEmailVerified(email, purpose) {
 }
 
 async function sendMailWithTimeout(transporter, mail) {
-  return Promise.race([
-    transporter.sendMail(mail),
-    new Promise((_, reject) => setTimeout(() => reject(new Error("SMTP send timeout")), SMTP_SEND_TIMEOUT))
-  ]);
+  let timer;
+  try {
+    return await Promise.race([
+      transporter.sendMail(mail),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Gmail SMTP operation timed out")), SMTP_SEND_TIMEOUT);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function sendOtp(req, res) {
@@ -200,9 +208,9 @@ async function sendOtp(req, res) {
   if (!transporter) {
     return sendJson(res, 503, {
       success: false,
-      error: "SMTP_NOT_CONFIGURED",
-      message: "OTP email service is not configured on the server.",
-      requiredEnvironment: ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS"]
+      error: "GMAIL_NOT_CONFIGURED",
+      message: "Gmail OTP service is not configured on the server.",
+      requiredEnvironment: ["SMTP_USER", "SMTP_PASS"]
     });
   }
 
@@ -237,12 +245,23 @@ async function sendOtp(req, res) {
   } catch (error) {
     records = readOtps().filter(item => item.id !== record.id);
     writeOtps(records);
-    console.error("[OTP EMAIL]", error.message);
+    console.error("[OTP EMAIL]", error.code || "ERROR", error.message);
+
+    let errorType = "GMAIL_SEND_FAILED";
+    if (error.message.includes("timed out") || error.code === "ETIMEDOUT") {
+      errorType = "GMAIL_CONNECTION_TIMEOUT";
+    } else if (error.code === "EAUTH") {
+      errorType = "GMAIL_AUTH_FAILED";
+    } else if (error.code === "ECONNECTION" || error.code === "ECONNREFUSED") {
+      errorType = "GMAIL_CONNECTION_FAILED";
+    }
+
     return sendJson(res, 502, {
       success: false,
-      error: "OTP_SEND_FAILED",
-      message: "The verification email could not be sent.",
-      details: process.env.NODE_ENV === "production" ? undefined : error.message
+      error: errorType,
+      message: "Gmail could not be reached to send the verification email.",
+      retryable: true,
+      details: process.env.NODE_ENV === "production" ? undefined : (error.code || error.message)
     });
   } finally {
     try { transporter.close(); } catch {}
