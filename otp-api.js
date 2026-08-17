@@ -13,8 +13,6 @@ const OTP_TTL_MS = 10 * 60 * 1000;
 const RESEND_COOLDOWN_MS = 60 * 1000;
 const MAX_ATTEMPTS = 5;
 
-// Keep SMTP operations short so an unavailable mail server never leaves
-// the HTTP request hanging until Render's proxy returns a 502.
 const SMTP_CONNECTION_TIMEOUT = 5000;
 const SMTP_GREETING_TIMEOUT = 5000;
 const SMTP_SOCKET_TIMEOUT = 7000;
@@ -66,8 +64,6 @@ function createTransporter() {
 
   if (!user || !pass) return null;
 
-  // Gmail-specific transporter. Nodemailer handles smtp.gmail.com,
-  // port 465 and TLS configuration for us.
   return nodemailer.createTransport({
     service: "gmail",
     auth: { user, pass },
@@ -91,15 +87,12 @@ function parseBody(req) {
   return new Promise((resolve, reject) => {
     let raw = "";
     let settled = false;
-
     const fail = error => {
       if (settled) return;
       settled = true;
       reject(error);
     };
-
     req.setTimeout(5000, () => fail(new Error("Request body timeout")));
-
     req.on("data", chunk => {
       raw += chunk.toString();
       if (raw.length > 1024 * 1024) {
@@ -107,7 +100,6 @@ function parseBody(req) {
         try { req.destroy(); } catch {}
       }
     });
-
     req.on("end", () => {
       if (settled) return;
       try {
@@ -117,7 +109,6 @@ function parseBody(req) {
         fail(new Error("Invalid JSON body"));
       }
     });
-
     req.on("error", fail);
     req.on("aborted", () => fail(new Error("Request aborted")));
   });
@@ -167,6 +158,79 @@ async function sendMailWithTimeout(transporter, mail) {
     ]);
   } finally {
     if (timer) clearTimeout(timer);
+  }
+}
+
+async function testGmailSmtp(req, res) {
+  const user = String(process.env.SMTP_USER || "").trim();
+  const pass = String(process.env.SMTP_PASS || "");
+
+  if (!user || !pass) {
+    return sendJson(res, 503, {
+      success: false,
+      smtp: "gmail",
+      connection: false,
+      authenticated: false,
+      error: "GMAIL_NOT_CONFIGURED",
+      message: "SMTP_USER or SMTP_PASS is missing on the server.",
+      requiredEnvironment: ["SMTP_USER", "SMTP_PASS"]
+    });
+  }
+
+  const transporter = createTransporter();
+  const startedAt = Date.now();
+
+  try {
+    await transporter.verify();
+    const elapsedMs = Date.now() - startedAt;
+    console.log(`[GMAIL TEST] SMTP verified successfully in ${elapsedMs}ms`);
+
+    return sendJson(res, 200, {
+      success: true,
+      smtp: "gmail",
+      connection: true,
+      authenticated: true,
+      message: "Gmail SMTP connection and authentication are working.",
+      elapsedMs,
+      account: user,
+      server: "smtp.gmail.com"
+    });
+  } catch (error) {
+    const elapsedMs = Date.now() - startedAt;
+    console.error("[GMAIL TEST]", error.code || "ERROR", error.message);
+
+    let errorType = "GMAIL_SMTP_TEST_FAILED";
+    let message = "Gmail SMTP connection or authentication failed.";
+
+    if (error.code === "EAUTH") {
+      errorType = "GMAIL_AUTH_FAILED";
+      message = "Gmail SMTP was reached, but authentication failed. Check the Gmail address and App Password.";
+    } else if (
+      error.code === "ETIMEDOUT" ||
+      String(error.message || "").toLowerCase().includes("timed out")
+    ) {
+      errorType = "GMAIL_CONNECTION_TIMEOUT";
+      message = "The server could not reach Gmail SMTP before the timeout.";
+    } else if (error.code === "ECONNECTION" || error.code === "ECONNREFUSED") {
+      errorType = "GMAIL_CONNECTION_FAILED";
+      message = "The server could not establish a connection to Gmail SMTP.";
+    }
+
+    return sendJson(res, 502, {
+      success: false,
+      smtp: "gmail",
+      connection: false,
+      authenticated: error.code === "EAUTH" ? false : null,
+      error: errorType,
+      message,
+      elapsedMs,
+      account: user,
+      server: "smtp.gmail.com",
+      details: process.env.NODE_ENV === "production" ? undefined : (error.code || error.message),
+      retryable: error.code !== "EAUTH"
+    });
+  } finally {
+    try { transporter.close(); } catch {}
   }
 }
 
@@ -336,6 +400,17 @@ async function verifyOtp(req, res) {
 }
 
 function handleOtpRequest(req, res, pathname) {
+  if (req.method === "GET" && pathname === "/api/v1/system/gmail-smtp-test") {
+    testGmailSmtp(req, res).catch(error => sendJson(res, 500, {
+      success: false,
+      smtp: "gmail",
+      connection: false,
+      error: "GMAIL_TEST_ERROR",
+      message: error.message
+    }));
+    return true;
+  }
+
   if (!pathname.startsWith("/api/v1/auth/otp")) return false;
 
   if (req.method === "POST" && pathname === "/api/v1/auth/otp/send") {
