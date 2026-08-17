@@ -166,6 +166,90 @@ function publishDueItems(now = new Date()) {
     }
 }
 
+/* =====================================================
+   SERVER-SIDE COUNTDOWN
+=====================================================
+
+The countdown is calculated from the scheduled timestamp and the
+server clock. The frontend does not need to calculate the target time.
+The API can therefore expose an authoritative remaining duration.
+*/
+function getCountdown(targetAt, now = new Date()) {
+    const targetMs = new Date(targetAt).getTime();
+    const nowMs = now.getTime();
+
+    if (!Number.isFinite(targetMs)) {
+        return {
+            available: false,
+            status: "INVALID_TIME",
+            milliseconds: null,
+            seconds: null,
+            formatted: null
+        };
+    }
+
+    const remainingMs = Math.max(0, targetMs - nowMs);
+    const totalSeconds = Math.floor(remainingMs / 1000);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+
+    return {
+        available: remainingMs > 0,
+        status: remainingMs > 0 ? "UPCOMING" : "AVAILABLE",
+        milliseconds: remainingMs,
+        seconds: totalSeconds,
+        formatted:
+            `${String(hours).padStart(2, "0")}:` +
+            `${String(minutes).padStart(2, "0")}:` +
+            `${String(seconds).padStart(2, "0")}`
+    };
+}
+
+function getPublishCountdown(item, now) {
+    const publish = getCountdown(item.publishAt, now);
+
+    if (item.published) {
+        return {
+            ...publish,
+            status: "PUBLISHED",
+            available: false,
+            milliseconds: 0,
+            seconds: 0,
+            formatted: "00:00:00"
+        };
+    }
+
+    return publish;
+}
+
+function getScheduleItem(item, now = new Date()) {
+    const scheduledCountdown = getCountdown(item.scheduledAt, now);
+    const publishCountdown = getPublishCountdown(item, now);
+
+    let status = "UPCOMING";
+
+    if (scheduledCountdown.status === "AVAILABLE") {
+        status = "AVAILABLE";
+    }
+
+    if (item.published && scheduledCountdown.status === "AVAILABLE") {
+        status = "READY";
+    }
+
+    return {
+        id: item.id,
+        odd: item.odd,
+        scheduledAt: item.scheduledAt,
+        publishAt: item.publishAt,
+        published: item.published,
+        publishedRecordId: item.publishedRecordId,
+        status,
+        countdown: scheduledCountdown,
+        publishCountdown
+    };
+}
+
 function tick() {
     if (!installed || !ENABLED) return;
 
@@ -217,14 +301,7 @@ function getStatus() {
         lastPlanAt,
         lastPublishedAt,
         lastError,
-        plan: plan.map(item => ({
-            id: item.id,
-            odd: item.odd,
-            scheduledAt: item.scheduledAt,
-            publishAt: item.publishAt,
-            published: item.published,
-            publishedRecordId: item.publishedRecordId
-        }))
+        plan: plan.map(item => getScheduleItem(item, now))
     };
 }
 
@@ -232,5 +309,6 @@ module.exports = {
     install,
     getStatus,
     createDailyPlan,
-    publishDueItems
+    publishDueItems,
+    getCountdown
 };
