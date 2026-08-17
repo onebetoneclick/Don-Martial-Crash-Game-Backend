@@ -2,52 +2,74 @@
 
 const crypto = require("crypto");
 const planManager = require("./api-plan-manager");
+const subscriptionManager = require("./subscription-manager");
 
 /*
 =========================================================
  DON MARTIAL API KEY MANAGER
 =========================================================
 
-Every generated key has a plan and its permissions are
-checked on the backend. Plaintext keys are never stored.
+Every generated key has an owner userId and a plan.
+Plaintext keys are never stored.
 
-Plans:
-  starter    -> no upcoming Big Odd
-  premium    -> 3 upcoming Big Odds
-  enterprise -> 5 upcoming Big Odds
-  ultimate   -> 10 upcoming Big Odds
+The subscription is the source of truth for the user's
+plan when an owner is attached to a key. This lets a future
+OPay payment upgrade the user's subscription and immediately
+change the permissions of the existing API key.
 
-IMPORTANT:
-This in-memory registry is the first API-key layer. The
-subscription/database layer can later persist these records
-without changing the API contract.
+Current storage is in-memory. It can later be replaced by
+Supabase/PostgreSQL without changing the API contract.
 =========================================================
 */
 
 const generatedKeys = new Map();
 
 function hashKey(key) {
-    return crypto
-        .createHash("sha256")
-        .update(String(key), "utf8")
-        .digest("hex");
+    return crypto.createHash("sha256").update(String(key), "utf8").digest("hex");
 }
 
 function generateApiKey(options = {}) {
+    const userId = String(options.userId || "").trim() || null;
     const plan = planManager.normalizePlan(options.plan);
     const key = `mt_live_${crypto.randomBytes(24).toString("hex")}`;
     const keyHash = hashKey(key);
     const now = new Date().toISOString();
 
-    generatedKeys.set(keyHash, {
+    if (userId) {
+        subscriptionManager.ensureUser({
+            userId,
+            name: options.name,
+            email: options.email
+        });
+        subscriptionManager.createOrUpdateSubscription(userId, {
+            plan,
+            status: "active"
+        });
+    }
+
+    const record = {
         keyId: `key_${crypto.randomBytes(8).toString("hex")}`,
+        userId,
         plan,
         status: "active",
         createdAt: now,
-        lastUsedAt: null
-    });
+        lastUsedAt: null,
+        requestCount: 0
+    };
 
-    return key;
+    generatedKeys.set(keyHash, record);
+    return { key, record };
+}
+
+function syncPlanFromSubscription(record) {
+    if (!record || !record.userId) return record;
+
+    const subscription = subscriptionManager.getSubscription(record.userId);
+    if (subscription && subscriptionManager.isSubscriptionActive(subscription)) {
+        record.plan = planManager.normalizePlan(subscription.plan);
+    }
+
+    return record;
 }
 
 function getKeyRecord(key) {
@@ -57,7 +79,9 @@ function getKeyRecord(key) {
     const record = generatedKeys.get(hashKey(supplied));
     if (!record || record.status !== "active") return null;
 
+    syncPlanFromSubscription(record);
     record.lastUsedAt = new Date().toISOString();
+    record.requestCount = Number(record.requestCount || 0) + 1;
     return record;
 }
 
@@ -65,12 +89,20 @@ function getApiKeyInfo(key) {
     const record = getKeyRecord(key);
     if (!record) return null;
 
+    const profile = record.userId
+        ? subscriptionManager.getUserProfile(record.userId)
+        : null;
+
     return {
         keyId: record.keyId,
+        userId: record.userId,
         plan: planManager.getPlanResponse(record.plan),
         status: record.status,
         createdAt: record.createdAt,
-        lastUsedAt: record.lastUsedAt
+        lastUsedAt: record.lastUsedAt,
+        requestCount: record.requestCount,
+        user: profile ? profile.user : null,
+        subscription: profile ? profile.subscription : null
     };
 }
 
@@ -100,19 +132,12 @@ function sendJson(res, statusCode, payload) {
         "Cache-Control": "no-store",
         "Access-Control-Allow-Origin": "*"
     });
-
     res.end(JSON.stringify(payload));
 }
 
 function isAdmin(req) {
-    const configuredAdminKey = String(
-        process.env.BIG_ODD_ADMIN_KEY || ""
-    ).trim();
-
-    const suppliedAdminKey = String(
-        req.headers["x-admin-key"] || ""
-    ).trim();
-
+    const configuredAdminKey = String(process.env.BIG_ODD_ADMIN_KEY || "").trim();
+    const suppliedAdminKey = String(req.headers["x-admin-key"] || "").trim();
     return Boolean(configuredAdminKey && suppliedAdminKey && suppliedAdminKey === configuredAdminKey);
 }
 
@@ -140,7 +165,6 @@ function handleApiKeyRequest(req, res, pathname) {
             sendJson(res, 405, { success: false, error: "METHOD_NOT_ALLOWED" });
             return true;
         }
-
         sendJson(res, 200, {
             success: true,
             plans: planManager.listPlans().map(plan => planManager.getPlanResponse(plan.id))
@@ -154,9 +178,7 @@ function handleApiKeyRequest(req, res, pathname) {
             return true;
         }
 
-        const key = getRequestKey(req);
-        const info = getApiKeyInfo(key);
-
+        const info = getApiKeyInfo(getRequestKey(req));
         if (!info) {
             sendJson(res, 401, {
                 success: false,
@@ -166,10 +188,7 @@ function handleApiKeyRequest(req, res, pathname) {
             return true;
         }
 
-        sendJson(res, 200, {
-            success: true,
-            data: info
-        });
+        sendJson(res, 200, { success: true, data: info });
         return true;
     }
 
@@ -188,7 +207,6 @@ function handleApiKeyRequest(req, res, pathname) {
     }
 
     let body = "";
-
     req.on("data", chunk => {
         body += chunk.toString();
         if (body.length > 10000) req.destroy();
@@ -196,7 +214,6 @@ function handleApiKeyRequest(req, res, pathname) {
 
     req.on("end", () => {
         let input = {};
-
         try {
             input = body ? JSON.parse(body) : {};
         } catch {
@@ -205,12 +222,19 @@ function handleApiKeyRequest(req, res, pathname) {
         }
 
         const plan = planManager.normalizePlan(input.plan);
-        const apiKey = generateApiKey({ plan });
+        const result = generateApiKey({
+            plan,
+            userId: input.userId,
+            name: input.name,
+            email: input.email
+        });
 
         sendJson(res, 201, {
             success: true,
             message: "API key created. Store this key securely; the plaintext key will not be returned again.",
-            apiKey,
+            apiKey: result.key,
+            keyId: result.record.keyId,
+            userId: result.record.userId,
             plan: planManager.getPlanResponse(plan),
             endpoints: {
                 current: "/api/v1/big-odd/current",
@@ -218,9 +242,12 @@ function handleApiKeyRequest(req, res, pathname) {
                 today: "/api/v1/big-odd/today",
                 upcoming: planManager.getPlan(plan).upcomingBigOdd
                     ? "/api/v1/big-odd/upcoming"
+                    : null,
+                schedulerStatus: planManager.getPlan(plan).upcomingBigOdd
+                    ? "/api/v1/big-odd/scheduler-status"
                     : null
             },
-            createdAt: new Date().toISOString()
+            createdAt: result.record.createdAt
         });
     });
 
