@@ -4,17 +4,6 @@
 =========================================================
  DON MARTIAL BIG ODD BOOTSTRAP
 =========================================================
-
-Loads the Big Odd REST API, API-key manager, live WebSocket
-bridge, and daily Big Odd scheduler before server.js creates
-its HTTP/WebSocket server.
-
-Browser access:
-- Big Odd scheduler-status is intentionally public for the
-  current frontend test.
-- CORS headers are applied here because these routes are
-  intercepted before server.js gets the request.
-=========================================================
 */
 
 const http = require("http");
@@ -23,6 +12,7 @@ const bigOddApi = require("./big-odd-api");
 const apiKeyManager = require("./api-key-manager");
 const bigOddWebSocketBridge = require("./big-odd-websocket-bridge");
 const bigOddScheduler = require("./big-odd-scheduler");
+const opayApi = require("./opay-api");
 
 const originalCreateServer = http.createServer;
 
@@ -58,15 +48,8 @@ http.createServer = function patchedCreateServer(...args) {
                     req.url || "/",
                     `http://${req.headers.host || "localhost"}`
                 ).pathname;
-            } catch {
-                // Keep raw URL if parsing fails.
-            }
+            } catch {}
 
-            /*
-             * Handle browser preflight before the public Big Odd
-             * routes. This also makes future frontend requests
-             * with custom headers work correctly.
-             */
             if (
                 req.method === "OPTIONS" &&
                 pathname.startsWith("/api/v1/")
@@ -84,7 +67,6 @@ http.createServer = function patchedCreateServer(...args) {
                     serverTime: new Date().toISOString(),
                     bridge: bigOddWebSocketBridge.getStatus()
                 });
-
                 return;
             }
 
@@ -95,7 +77,6 @@ http.createServer = function patchedCreateServer(...args) {
                     serverTime: new Date().toISOString(),
                     scheduler: bigOddScheduler.getStatus()
                 });
-
                 return;
             }
 
@@ -108,8 +89,22 @@ http.createServer = function patchedCreateServer(...args) {
                     res,
                     pathname
                 );
-
                 if (handled) return;
+            }
+
+            if (pathname.startsWith("/api/v1/payments/opay")) {
+                opayApi.handleOpayRequest(req, res, pathname)
+                    .catch(error => {
+                        console.error("[OPAY ROUTE]", error);
+                        if (!res.headersSent) {
+                            sendJson(res, 500, {
+                                success: false,
+                                error: "OPAY_ROUTE_ERROR",
+                                message: error.message
+                            });
+                        }
+                    });
+                return;
             }
 
             if (pathname.startsWith("/api/v1/big-odd/")) {
@@ -118,7 +113,6 @@ http.createServer = function patchedCreateServer(...args) {
                     res,
                     pathname
                 );
-
                 if (handled) return;
             }
 
@@ -133,3 +127,4 @@ bigOddWebSocketBridge.install();
 bigOddScheduler.install();
 
 console.log("[BIG ODD] Bootstrap loaded");
+console.log("[OPAY] Payment API routes loaded");
