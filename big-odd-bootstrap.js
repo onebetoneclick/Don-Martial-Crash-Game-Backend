@@ -10,6 +10,7 @@ const http = require("http");
 
 const bigOddApi = require("./big-odd-api");
 const apiKeyManager = require("./api-key-manager");
+const planManager = require("./api-plan-manager");
 const bigOddWebSocketBridge = require("./big-odd-websocket-bridge");
 const bigOddScheduler = require("./big-odd-scheduler");
 const opayApi = require("./opay-api");
@@ -27,6 +28,7 @@ function setCorsHeaders(res) {
 }
 
 function sendJson(res, statusCode, payload) {
+    if (res.headersSent) return;
     setCorsHeaders(res);
     res.writeHead(statusCode, {
         "Content-Type": "application/json; charset=utf-8",
@@ -57,6 +59,27 @@ http.createServer = function patchedCreateServer(...args) {
                 setCorsHeaders(res);
                 res.writeHead(204);
                 res.end();
+                return;
+            }
+
+            /* Public API plan catalog */
+            if (pathname === "/api/v1/api-key/plans") {
+                if (req.method !== "GET") {
+                    sendJson(res, 405, {
+                        success: false,
+                        error: "METHOD_NOT_ALLOWED"
+                    });
+                    return;
+                }
+
+                sendJson(res, 200, {
+                    success: true,
+                    type: "api-plans",
+                    serverTime: new Date().toISOString(),
+                    data: planManager.listPlans().map(plan =>
+                        planManager.getPlanResponse(plan.id)
+                    )
+                });
                 return;
             }
 
